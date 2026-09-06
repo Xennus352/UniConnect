@@ -12,6 +12,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import {
+  apiFetch,
   getCourses,
   getMeetingRequirements,
   createMeetingRequirement,
@@ -19,7 +20,7 @@ import {
   deleteMeetingRequirement,
   MEETING_TYPE_LABELS,
 } from '@/components/shared/api';
-import type { CourseRecord, MeetingRequirementResponse, MeetingType } from '@/components/shared/api';
+import type { CourseRecord, MeetingRequirementResponse, MeetingType, OrganizationalUnitRecord } from '@/components/shared/api';
 import { useTimetableRealtime, TIMETABLE_REALTIME_EVENTS } from '@/lib/supabase/useTimetableRealtime';
 import { toast } from 'sonner';
 
@@ -28,6 +29,7 @@ const MAX_TOTAL_PERIODS = 4;
 interface CourseRequirementsPanelProps {
   unitId: string;
   lobbyId?: string | null;
+  semesters?: { semesterId: string; semesterNo: number }[];
   onChanged?: () => void;
 }
 
@@ -45,9 +47,11 @@ interface DraftRow {
   saving: boolean;
 }
 
-export default function CourseRequirementsPanel({ unitId, lobbyId, onChanged }: CourseRequirementsPanelProps) {
+export default function CourseRequirementsPanel({ unitId, lobbyId, semesters, onChanged }: CourseRequirementsPanelProps) {
   const [courses, setCourses] = useState<CourseRecord[] | null>(null);
   const [requirements, setRequirements] = useState<MeetingRequirementResponse[] | null>(null);
+  const [units, setUnits] = useState<OrganizationalUnitRecord[]>([]);
+  const [selectedUnitId, setSelectedUnitId] = useState<string>(unitId);
   const [courseId, setCourseId] = useState<string>('');
   const [semesterNo, setSemesterNo] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -76,31 +80,49 @@ export default function CourseRequirementsPanel({ unitId, lobbyId, onChanged }: 
     [rows]
   );
 
+  const semestersArr = useMemo(() => semesters ?? [], [semesters]);
+  const scopeSemesterId = useMemo(() => {
+    if (semesterNo === null || semestersArr.length === 0) return undefined;
+    return semestersArr.find((s) => s.semesterNo === semesterNo)?.semesterId ?? undefined;
+  }, [semesterNo, semestersArr]);
+
   const load = useCallback(async () => {
     try {
       const [courseList, reqs] = await Promise.all([
-        getCourses({ unitId }),
-        getMeetingRequirements({ unitId }),
+        getCourses({ unitId: selectedUnitId, semesterId: scopeSemesterId }),
+        getMeetingRequirements({ unitId: selectedUnitId, semesterId: scopeSemesterId }),
       ]);
       setCourses(courseList);
       setRequirements(reqs);
       setError(null);
       if (!courseId && courseList.length > 0) {
         setCourseId(courseList[0].courseId);
-        const firstSem = courseList[0].semesterNo;
-        setSemesterNo(firstSem);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not load course requirements');
     } finally {
       setLoading(false);
     }
-  }, [unitId, courseId]);
+  }, [selectedUnitId, courseId, scopeSemesterId]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial requirements load
     load();
   }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch<OrganizationalUnitRecord[]>('/api/organizational-units')
+      .then((list) => {
+        if (!cancelled) setUnits(list);
+      })
+      .catch(() => {
+        if (!cancelled) toast.error('Could not load units');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useTimetableRealtime(lobbyId, (event) => {
     if (
@@ -108,19 +130,25 @@ export default function CourseRequirementsPanel({ unitId, lobbyId, onChanged }: 
       event.type === TIMETABLE_REALTIME_EVENTS.COURSE_REQUIREMENT_UPDATED ||
       event.type === TIMETABLE_REALTIME_EVENTS.COURSE_REQUIREMENT_DELETED
     ) {
-      getMeetingRequirements({ unitId })
+      getMeetingRequirements({ unitId: selectedUnitId, semesterId: scopeSemesterId })
         .then(setRequirements)
         .catch(() => {});
     }
   });
 
   const semesterOptions = useMemo(() => {
+    if (semestersArr.length > 0) {
+      return semestersArr
+        .slice()
+        .sort((a, b) => a.semesterNo - b.semesterNo)
+        .map((s) => [s.semesterNo, []] as [number, CourseRecord[]]);
+    }
     const map = new Map<number, CourseRecord[]>();
     (courses ?? []).forEach((c) => {
       map.set(c.semesterNo, [...(map.get(c.semesterNo) ?? []), c]);
     });
     return Array.from(map.entries()).sort((a, b) => a[0] - b[0]);
-  }, [courses]);
+  }, [courses, semestersArr]);
 
   const visibleCourses = useMemo(() => {
     if (semesterNo === null) return courses ?? [];
@@ -239,7 +267,51 @@ export default function CourseRequirementsPanel({ unitId, lobbyId, onChanged }: 
       </div>
 
       <div style={{ padding: '14px 18px', borderBottom: '1px solid var(--surface)' }}>
+        <div className="relative mb-3">
+          <select
+            value={selectedUnitId}
+            onChange={(e) => {
+              setCourseId('');
+              setSelectedUnitId(e.target.value);
+            }}
+            className="w-full appearance-none cursor-pointer"
+            style={{
+              fontSize: 13,
+              padding: '8px 30px 8px 12px',
+              borderRadius: 'var(--radius-md)',
+              border: '1.5px solid var(--surface-border)',
+              background: 'var(--divider)',
+              color: 'var(--text)',
+              outline: 'none',
+            }}
+          >
+            {units.length === 0 ? (
+              <option value={selectedUnitId}>{selectedUnitId}</option>
+            ) : (
+              units.map((u) => (
+                <option key={u.unitId} value={u.unitId}>{u.unitName}</option>
+              ))
+            )}
+          </select>
+          <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-lighter)' }} />
+        </div>
+
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+          <button
+            onClick={() => setSemesterNo(null)}
+            className="cursor-pointer"
+            style={{
+              fontSize: 12,
+              fontWeight: 600,
+              padding: '5px 12px',
+              borderRadius: 14,
+              border: semesterNo === null ? '1.5px solid var(--primary)' : '1.5px solid var(--surface-border)',
+              background: semesterNo === null ? 'rgba(40,114,161,0.15)' : 'var(--divider)',
+              color: semesterNo === null ? 'var(--primary)' : 'var(--text-light)',
+            }}
+          >
+            All semesters
+          </button>
           {semesterOptions.map(([no]) => (
             <button
               key={no}

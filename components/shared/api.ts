@@ -427,7 +427,7 @@ export interface RollCallHistoryResponse {
   students: RollCallHistoryStudent[];
 }
 
-export function getRollCallHistory(
+export async function getRollCallHistory(
   courseCode: string,
   semesterNo: number,
   sectionName: string,
@@ -439,7 +439,28 @@ export function getRollCallHistory(
     `&sectionName=${encodeURIComponent(sectionName)}` +
     `&fromDate=${encodeURIComponent(fromDate)}` +
     `&toDate=${encodeURIComponent(toDate)}`;
-  return apiFetch(`/api/rollcall/history?${qs}`);
+  const [resp, offset] = await Promise.all([
+    apiFetch<RollCallHistoryResponse>(`/api/rollcall/history?${qs}`),
+    rollCallClockOffset(),
+  ]);
+  if (!resp || offset === 0) return resp;
+  // Re-anchor server-shifted start/end onto the real 09:00-16:00 wall clock.
+  return {
+    ...resp,
+    schedule: {
+      ...resp.schedule,
+      slots: (resp.schedule?.slots ?? []).map((t) => ({
+        ...t,
+        startTime: shiftTimeOf(t.startTime, offset),
+        endTime: shiftTimeOf(t.endTime, offset),
+      })),
+    },
+    sessions: (resp.sessions ?? []).map((s) => ({
+      ...s,
+      startTime: shiftTimeOf(s.startTime, offset),
+      endTime: shiftTimeOf(s.endTime, offset),
+    })),
+  };
 }
 
 /** Delete a CLASS_SESSION and all attendance rows belonging to it. */
@@ -502,8 +523,18 @@ export interface RollCallStudentsResponse {
   students: RollCallStudent[];
 }
 
-export function getRollCallMySchedule(): Promise<RollCallSchedule[]> {
-  return apiFetch('/api/rollcall/my-schedule');
+export async function getRollCallMySchedule(): Promise<RollCallSchedule[]> {
+  const [list, offset] = await Promise.all([
+    apiFetch<RollCallSchedule[]>('/api/rollcall/my-schedule'),
+    rollCallClockOffset(),
+  ]);
+  if (!Array.isArray(list) || offset === 0) return list;
+  // Re-anchor server-shifted start/end onto the real 09:00-16:00 wall clock.
+  return list.map((s) => ({
+    ...s,
+    startTime: shiftTimeOf(s.startTime, offset),
+    endTime: shiftTimeOf(s.endTime, offset),
+  }));
 }
 
 export function ensureRollCallSession(scheduleId: string, sessionDate?: string): Promise<ClassSessionRecord> {
@@ -514,12 +545,25 @@ export function ensureRollCallSession(scheduleId: string, sessionDate?: string):
   });
 }
 
-export function getRollCallStudents(
+export async function getRollCallStudents(
   scheduleId: string,
   sessionId?: string
 ): Promise<RollCallStudentsResponse> {
   const q = sessionId ? `&sessionId=${encodeURIComponent(sessionId)}` : '';
-  return apiFetch(`/api/rollcall/students?scheduleId=${encodeURIComponent(scheduleId)}${q}`);
+  const [resp, offset] = await Promise.all([
+    apiFetch<RollCallStudentsResponse>(`/api/rollcall/students?scheduleId=${encodeURIComponent(scheduleId)}${q}`),
+    rollCallClockOffset(),
+  ]);
+  if (!resp || offset === 0 || !Array.isArray(resp.slots)) return resp;
+  // Re-anchor server-shifted slot times onto the real 09:00-16:00 wall clock.
+  return {
+    ...resp,
+    slots: resp.slots.map((sl) => ({
+      ...sl,
+      startTime: shiftTimeOf(sl.startTime, offset),
+      endTime: shiftTimeOf(sl.endTime, offset),
+    })),
+  };
 }
 
 export function isBackendError(e: unknown): boolean {
@@ -561,6 +605,7 @@ export interface ScheduleResponse {
   endTime: string;
   scheduleStatus: ScheduleStatus;
   scheduleType: ScheduleType;
+  meetingType: MeetingType | null;
   sections: string[];
   staffNames: string[];
   createdAt: string;
@@ -584,6 +629,13 @@ export interface GenerationManageResponse {
   isHod: boolean;
   canManage: boolean;
   generation: GenerationSessionResponse | null;
+}
+
+export interface GenerationSnapshotResponse {
+  generationId: string;
+  snapshotId: string | null;
+  termId: string;
+  status: 'SNAPSHOT_PREPARING' | 'SNAPSHOT_READY' | 'SNAPSHOT_INVALID' | 'SNAPSHOT_ERROR';
 }
 
 export interface GenerationScopeSemester {
@@ -655,6 +707,8 @@ export interface TeachingGroupMemberResponse {
   staffName: string;
   sectionId: string;
   sectionName: string;
+  unitId: string;
+  unitName: string;
 }
 
 export interface TeachingGroupResponse {
@@ -732,6 +786,19 @@ export interface SwapScheduleRequest {
   targetDay: number;
   targetPeriod: number;
   force: boolean;
+  /** The drop-cell occupant the client offered the swap against (optional hint). */
+  targetScheduleId?: string;
+}
+
+export interface SwapCellRequest {
+  scheduleId: string;
+  sourceDay: number;
+  sourcePeriod: number;
+  targetDay: number;
+  targetPeriod: number;
+  force: boolean;
+  /** The drop-cell occupant the client offered the swap against (optional hint). */
+  targetScheduleId?: string;
 }
 
 export interface DragStatusRequest {
@@ -765,6 +832,66 @@ function queryString(params: Record<string, string | number | undefined | null>)
 
 export function getCurrentStaff(): Promise<StaffRecord> {
   return apiFetch('/api/staff/me');
+}
+
+export function getStaff(): Promise<StaffRecord[]> {
+  return apiFetch('/api/staff');
+}
+
+export function getUnitStaff(unitId: string): Promise<StaffRecord[]> {
+  return apiFetch(`/api/organizational-units/${unitId}/staff`);
+}
+
+export interface AssignedCourseResponse {
+  courseId: string;
+  courseCode: string;
+  courseName: string;
+  semesterId: string;
+  semesterNo: number;
+  sections: SectionInfoResponse[];
+}
+
+export interface LecturerResponse {
+  staffId: string;
+  staffNo: string;
+  staffName: string;
+  email: string;
+  phoneNo: string | null;
+  unitId: string;
+  unitName: string;
+  positions: string[];
+  courseCount: number;
+  assignedCourses: AssignedCourseResponse[];
+}
+
+export function getLecturers(termId?: string): Promise<LecturerResponse[]> {
+  return apiFetch(`/api/staff/lecturers${queryString({ termId })}`);
+}
+
+// ---------- Terms / semesters / majors / units / sections ----------
+
+export function getTerms(): Promise<AcademicTermRecord[]> {
+  return apiFetch('/api/terms');
+}
+
+export function getSemesters(): Promise<SemesterRecord[]> {
+  return apiFetch('/api/semesters');
+}
+
+export function getMajors(): Promise<MajorRecord[]> {
+  return apiFetch('/api/majors');
+}
+
+export function getUnitMajors(unitId: string): Promise<MajorRecord[]> {
+  return apiFetch(`/api/organizational-units/${unitId}/majors`);
+}
+
+export function getOrganizationalUnits(): Promise<OrganizationalUnitRecord[]> {
+  return apiFetch('/api/organizational-units');
+}
+
+export function getSections(): Promise<SectionRecord[]> {
+  return apiFetch('/api/sections');
 }
 
 // ---------- Schedules ----------
@@ -819,6 +946,64 @@ const minutesOf = (hm: string): number | null => {
   if (!m) return null;
   return Number(m[1]) * 60 + Number(m[2]);
 };
+
+// The timetable server can hand back a uniform timezone-shifted copy of the
+// wall-clock time_slots (same shift as normalizeTimeSlots re-anchors in the
+// grid). Roll-call schedule times must be re-anchored identically or the
+// "start/end" shown for a class would be hours off.
+
+/** Minutes to subtract from a raw roll-call time to land on real wall-clock. */
+async function rollCallClockOffset(): Promise<number> {
+  try {
+    const slots = await getTimeSlots();
+    const sorted = [...slots].sort(
+      (a, b) => a.displayOrder - b.displayOrder || a.periodNo - b.periodNo
+    );
+    const p1 = sorted.find((s) => s.periodNo === 1);
+    const p1Start = p1 ? minutesOf(p1.startTime) : null;
+    if (p1Start === null) return 0;
+    const offset = p1Start - 9 * 60;
+    const p6 = sorted.find((s) => s.periodNo === 6);
+    const p6End = p6 ? minutesOf(p6.endTime) : null;
+    if (p6End !== null && p6End - offset !== 16 * 60) return 0;
+    return offset;
+  } catch {
+    return 0;
+  }
+}
+
+/** "HH:mm[:ss]" minus deltaMinutes, wrapped to a 24h "HH:mm" wall-clock. */
+const shiftTimeOf = (hhmm: string, deltaMinutes: number): string => {
+  const parts = hhmm.split(':');
+  let total = Number(parts[0]) * 60 + Number(parts[1] ?? 0);
+  total = (((total - deltaMinutes) % 1440) + 1440) % 1440;
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+};
+
+/**
+ * Minutes to subtract from a timetable time the server returned as a
+ * timezone-shifted copy, so it lands on the authoritative wall-clock grid
+ * (P1 starts 09:00, P6 ends 16:00). Returns 0 when the grid is already real.
+ */
+export function timeSlotOffsetMinutes(slots: TimeSlotResponse[]): number {
+  if (!Array.isArray(slots) || slots.length === 0) return 0;
+  const sorted = [...slots].sort((a, b) => a.displayOrder - b.displayOrder || a.periodNo - b.periodNo);
+  const p1 = sorted.find((s) => s.periodNo === 1);
+  const p1Start = p1 ? minutesOf(p1.startTime) : null;
+  if (p1Start === null) return 0;
+  const offset = p1Start - 9 * 60;
+  const p6 = sorted.find((s) => s.periodNo === 6);
+  const p6End = p6 ? minutesOf(p6.endTime) : null;
+  if (p6End !== null && p6End - offset !== 16 * 60) return 0;
+  return offset;
+}
+
+/** Re-anchors a shifted "HH:mm[:ss]" timetable time onto the real wall-clock grid. */
+export function reanchorTime(hhmm: string, offsetMin: number): string {
+  return offsetMin === 0 ? hhmm : shiftTimeOf(hhmm, offsetMin);
+}
 
 const hmOf = (min: number): string =>
   `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
@@ -886,6 +1071,29 @@ export function getCourses(params?: {
   return apiFetch(`/api/courses${queryString(params ?? {})}`);
 }
 
+export interface CourseRequest {
+  unitId: string;
+  courseCode: string;
+  courseName: string;
+  creditUnit: number;
+  majorId?: string | null;
+  semesterId?: string | null;
+  isRequired?: boolean;
+  displayOrder?: number;
+}
+
+export function createCourse(request: CourseRequest): Promise<CourseRecord> {
+  return apiFetch('/api/courses', { method: 'POST', body: JSON.stringify(request) });
+}
+
+export function updateCourse(courseId: string, request: CourseRequest): Promise<CourseRecord> {
+  return apiFetch(`/api/courses/${courseId}`, { method: 'PUT', body: JSON.stringify(request) });
+}
+
+export function deleteCourse(courseId: string): Promise<void> {
+  return apiFetch(`/api/courses/${courseId}`, { method: 'DELETE' });
+}
+
 // ---------- Meeting requirements ----------
 
 export function getMeetingRequirements(params?: {
@@ -939,10 +1147,42 @@ export function deleteTeachingGroup(groupId: string): Promise<void> {
   return apiFetch(`/api/teaching-groups/${groupId}`, { method: 'DELETE' });
 }
 
+export function addTeachingGroupMembers(
+  groupId: string,
+  assignmentIds: string[]
+): Promise<TeachingGroupResponse> {
+  return apiFetch(`/api/teaching-groups/${groupId}/members`, {
+    method: 'POST',
+    body: JSON.stringify({ assignmentIds }),
+  });
+}
+
 // ---------- Teaching assignments ----------
 
-export function getTeachingAssignments(): Promise<TeachingAssignmentResponse[]> {
-  return apiFetch('/api/teaching-assignments');
+export function getTeachingAssignments(params?: {
+  termId?: string;
+  staffId?: string;
+  courseId?: string;
+  sectionId?: string;
+}): Promise<TeachingAssignmentResponse[]> {
+  return apiFetch(`/api/teaching-assignments${queryString(params ?? {})}`);
+}
+
+export interface TeachingAssignmentRequest {
+  courseId: string;
+  staffId: string;
+  sectionId: string;
+  termId: string;
+  assignmentStatus?: AssignmentStatus;
+  assignedByStaffId?: string | null;
+}
+
+export function createTeachingAssignment(request: TeachingAssignmentRequest): Promise<TeachingAssignmentResponse> {
+  return apiFetch('/api/teaching-assignments', { method: 'POST', body: JSON.stringify(request) });
+}
+
+export function deleteTeachingAssignment(assignmentId: string): Promise<void> {
+  return apiFetch(`/api/teaching-assignments/${assignmentId}`, { method: 'DELETE' });
 }
 
 // ---------- Exam types ----------
@@ -986,6 +1226,22 @@ export function generateTimetable(
   });
 }
 
+// Prepare (or reuse) the backend snapshot owned by generationId when an HOD
+// enters the shared workspace. Uses the long timeout because the first prepare
+// loads the term-wide source data from the database (can take tens of seconds).
+export function prepareSnapshot(generationId: string): Promise<GenerationSnapshotResponse> {
+  return apiFetch(`/api/generations/${generationId}/snapshot/prepare`, {
+    method: 'POST',
+    timeoutMs: GENERATION_TIMEOUT_MS,
+  });
+}
+
+// Returns the current backend snapshot status for generationId so the frontend
+// can recover SNAPSHOT_READY after refresh/reconnect without rebuilding.
+export function getGenerationSnapshot(generationId: string): Promise<GenerationSnapshotResponse> {
+  return apiFetch(`/api/generations/${generationId}/snapshot`);
+}
+
 export function publishGeneration(generationId: string): Promise<GenerationSessionResponse> {
   return apiFetch(`/api/generations/${generationId}/publish`, { method: 'POST' });
 }
@@ -1014,6 +1270,44 @@ export function swapSchedules(generationId: string, request: SwapScheduleRequest
     method: 'POST',
     body: JSON.stringify(request),
   });
+}
+
+export function swapCellSchedules(generationId: string, request: SwapCellRequest): Promise<SwapScheduleResponse> {
+  return apiFetch(`/api/generations/${generationId}/swap-cell`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+}
+
+export interface CreateScheduleRequest {
+  generationId: string;
+  teachingAssignmentId?: string | null;
+  teachingGroupId?: string | null;
+  dayOfWeek: number;
+  startSlotId: string;
+  endSlotId: string;
+  scheduleType: ScheduleType;
+  scheduleStatus?: ScheduleStatus | null;
+  meetingType?: MeetingType | null;
+}
+
+/** Re-create a schedule in a draft generation (used to undo a delete). */
+export function createSchedule(request: CreateScheduleRequest): Promise<ScheduleResponse> {
+  return apiFetch('/api/schedules', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+}
+
+/** Permanently remove a schedule from a draft generation. Refused for PUBLISHED drafts. */
+export function deleteSchedule(scheduleId: string): Promise<void> {
+  return apiFetch(`/api/schedules/${scheduleId}`, { method: 'DELETE' });
+}
+
+// Broadcasts a lobby-scoped TIMETABLE_EDIT_STARTED so every joined HOD browser
+// navigates to the same dedicated edit workspace.
+export function notifyEditStarted(generationId: string): Promise<void> {
+  return apiFetch(`/api/generations/${generationId}/edit`, { method: 'POST' });
 }
 
 // ---------- Single-operator editing lock ----------

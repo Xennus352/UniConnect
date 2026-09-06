@@ -27,7 +27,7 @@ import {
   AlertTriangle, Radio, UserPlus, ChevronDown, Timer,
   XCircle, Blocks, Layers, ShieldCheck, Send, Move,
   ClipboardCheck,
-  History,
+  History, Undo2, Redo2,
 } from 'lucide-react';
 import Link from 'next/link';
 import { fmt12h, fmtRange12 } from '@/components/shared/time';
@@ -52,6 +52,7 @@ import {
   getCourses,
   getTeachingGroups,
   createTeachingGroup,
+  addTeachingGroupMembers,
   deleteTeachingGroup,
   getTeachingAssignments,
   getPublishedSchedules,
@@ -61,8 +62,12 @@ import {
   releaseTimetableLock,
   generateTimetable,
   publishGeneration,
+  prepareSnapshot,
   cancelGeneration,
   swapSchedules,
+  swapCellSchedules,
+  createSchedule,
+  deleteSchedule,
   publishDragStatus,
   createGenerationLobby,
   joinGenerationLobby,
@@ -83,7 +88,7 @@ import type {
   CourseRecord, StudentRecord,
 } from '@/components/shared/api';
 import { useUniversityData } from '@/components/shared/useUniversityData';
-import { useTimetableRealtime, TIMETABLE_REALTIME_EVENTS } from '@/lib/supabase/useTimetableRealtime';
+import { useTimetableRealtime, useTimetableRealtimeGeneration, TIMETABLE_REALTIME_EVENTS } from '@/lib/supabase/useTimetableRealtime';
 import CourseRequirementsPanel from '@/components/lecturer/CourseRequirementsPanel';
 export { default as FeedSection } from '@/components/shared/FeedSection';
 export { default as MessagesSection } from '@/components/shared/MessagesSection';
@@ -222,7 +227,7 @@ function StudentInfoModal({ student, onClose }: { student: StudentRecord; onClos
   return (
     <>
       <style>{`
-        dialog.sim-pop::backdrop { background: rgba(4, 10, 16, 0.55); animation: sim-fade 0.2s ease-out; }
+        dialog.sim-pop::backdrop { background: rgba(4, 10, 16, 0.35); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); animation: sim-fade 0.2s ease-out; }
         dialog.sim-pop[open] { animation: sim-pop 0.25s cubic-bezier(0.16, 1, 0.3, 1); }
         @keyframes sim-fade { from { opacity: 0; } to { opacity: 1; } }
         @keyframes sim-pop { from { opacity: 0; transform: scale(0.94) translateY(8px); } to { opacity: 1; transform: none; } }
@@ -907,7 +912,7 @@ export function RollCallSection({ mode = 'today', onViewHistory }: {
       {modalOpen && (
         <div role="dialog" aria-modal="true"
           className="fixed inset-0 z-40 flex items-center justify-center p-6"
-          style={{ background: 'rgba(15,23,42,0.45)' }}
+          style={MODAL_BACKDROP}
           onClick={() => { if (!busy) setModalOpen(false); }}>
           <div className="w-full max-w-2xl rounded-xl flex flex-col"
             style={{ background: 'var(--surface)', border: '1px solid var(--surface-border)', maxHeight: '85vh' }}
@@ -1044,7 +1049,7 @@ export function RollCallSection({ mode = 'today', onViewHistory }: {
       {/* Update-existing confirmation (above modal) */}
       {showUpdateConfirm && (
         <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center p-6"
-          style={{ background: 'rgba(15,23,42,0.55)' }} onClick={() => setShowUpdateConfirm(false)}>
+          style={MODAL_BACKDROP} onClick={() => setShowUpdateConfirm(false)}>
           <div className="w-full max-w-sm rounded-xl" style={{ background: 'var(--surface)', border: '1.5px solid var(--primary)', padding: 20 }}
             onClick={(e) => e.stopPropagation()}>
             <h3 style={{ fontWeight: 700, fontSize: 15, marginBottom: 8 }}>Roll Call already exists</h3>
@@ -1077,6 +1082,27 @@ const GRID_COLUMN_HEADERS = ['P1', 'P2', 'P3', 'LUNCH', 'P4', 'P5', 'P6'] as con
 const LUNCH_HEADER_COL = 3;
 const GRID_COLUMNS = '96px repeat(7, minmax(122px, 1fr))';
 const GRID_CELL_MIN_HEIGHT = 112;
+
+const MAX_PERIOD = 6;
+
+// Modal overlay backdrop: translucent + blurred so the timetable stays visible
+// (but soft) behind every dialog. Keep it uniform across the view.
+const MODAL_BACKDROP: { background: string; backdropFilter: string; WebkitBackdropFilter: string } = {
+  background: 'rgba(9, 25, 35, 0.35)',
+  backdropFilter: 'blur(8px)',
+  WebkitBackdropFilter: 'blur(8px)',
+};
+
+const ORDINALS = ['First', 'Second', 'Third', 'Fourth', 'Fifth', 'Sixth'] as const;
+
+// Human label for a semester tile: 1 -> "Semester 1 (First year – First
+// semester)", 2 -> "Semester 2 (First year – Second semester)", and so on.
+const semesterTileLabel = (n: number) => {
+  const year = Math.floor((n - 1) / 2) + 1;
+  const half = ((n - 1) % 2) + 1;
+  const yearWord = ORDINALS[year - 1] ?? `#${year}`;
+  return `Semester ${n} (${yearWord} year \u2013 ${half === 1 ? 'First' : 'Second'} semester)`;
+};
 const GENERATION_FALLBACK_MS = 45000;
 // Multi-section scopes solve asynchronously and can legitimately run for
 // several minutes on degraded database days (remote pooler, stale pooled
@@ -1209,14 +1235,39 @@ interface RemoteDragState {
   staffName: string;
   day: number | null;
   period: number | null;
+  schedule?: ScheduleResponse | null;
 }
 
 interface PendingSwapState {
   scheduleId: string;
   withScheduleId: string;
+  /** cell-swap: the grabbed cell; block-swap: the schedule's original anchor. */
+  sourceDay?: number;
+  sourcePeriod?: number;
   targetDay: number;
   targetPeriod: number;
+  /** cell-swap: the drop-cell occupant the client qualified (backend re-resolves when stale). */
+  targetScheduleId?: string;
   conflicts: string[] | null;
+  /** true = single-cell (per period) swap via /swap-cell. */
+  cell: boolean;
+}
+
+interface EditOp {
+  kind: 'move' | 'delete' | 'cellSwap';
+  scheduleId: string;
+  /** cellSwap: the swap partner's post-swap row (undo anchor on the target cell). */
+  withScheduleId?: string;
+  /** cellSwap: the dragged course's assignment id (survives row re-creation). */
+  srcAssignmentId?: string | null;
+  /** cellSwap: the partner's assignment id (null = special block). */
+  partnerAssignmentId?: string | null;
+  /** move: the cell the schedule leaves; delete: the snapshot needed to re-create it. */
+  fromDay?: number;
+  fromPeriod?: number;
+  toDay?: number;
+  toPeriod?: number;
+  schedule?: ScheduleResponse;
 }
 
 function eventId(): string {
@@ -1294,16 +1345,20 @@ function ScheduleCard({
   onDragStart,
   onDragEnd,
   onClick,
+  partPeriod,
 }: {
   schedule: ScheduleResponse;
   editable: boolean;
   onDragStart?: (e: DragEvt<HTMLDivElement>) => void;
   onDragEnd?: () => void;
   onClick?: () => void;
+  partPeriod?: number;
 }) {
   const cancelled = schedule.scheduleStatus === 'CANCELLED';
-  const meta = SCHEDULE_TYPE_META[schedule.scheduleType] ?? SCHEDULE_TYPE_META.COURSE;
   const isSpecial = schedule.scheduleType !== 'COURSE';
+  const isLab = schedule.scheduleType === 'COURSE' && schedule.meetingType === 'LAB';
+  const metaKey = isLab ? 'LAB' : schedule.scheduleType;
+  const meta = SCHEDULE_TYPE_META[metaKey] ?? SCHEDULE_TYPE_META.COURSE;
   const cardBg = cancelled ? 'var(--divider)' : meta.cardBg;
   return (
     <div
@@ -1352,8 +1407,46 @@ function ScheduleCard({
       >
         {isSpecial ? meta.label.toUpperCase() : schedule.courseCode}
       </span>
+      {!isSpecial && !cancelled && (
+        <span
+          className="badge badge-xs"
+          style={{
+            background: meta.bg,
+            color: meta.fg,
+            border: 'none',
+            fontWeight: 700,
+            lineHeight: 1,
+            padding: '1px 5px',
+            fontSize: 9.5,
+            letterSpacing: '0.3px',
+            textTransform: 'uppercase',
+          }}
+        >
+          {isLab ? 'Lab' : 'Lecture'}
+        </span>
+      )}
       {editable && !isSpecial && (
         <GripVertical size={12} style={{ color: 'var(--text-lighter)', position: 'absolute', top: 6, right: 6 }} />
+      )}
+      {partPeriod != null && (
+        <span
+          title={`Period P${partPeriod} of P${schedule.startPeriodNo}\u2013P${schedule.endPeriodNo} \u2014 dragging this part re-anchors the whole session`}
+          style={{
+            position: 'absolute',
+            bottom: 4,
+            left: 5,
+            fontSize: 9,
+            fontWeight: 800,
+            letterSpacing: '0.3px',
+            color: cancelled ? 'var(--text-lighter)' : '#fff',
+            background: 'rgba(15,23,42,0.35)',
+            padding: '1px 5px',
+            borderRadius: 999,
+            lineHeight: 1.4,
+          }}
+        >
+          P{partPeriod}
+        </span>
       )}
       {cancelled && (
         <span className="badge badge-xs" style={{ background: 'rgba(239,68,68,0.15)', color: '#dc2626', border: 'none', fontWeight: 700 }}>
@@ -1365,10 +1458,20 @@ function ScheduleCard({
 }
 
 const dayNameOf = (day: number) => GRID_DAY_NAMES[day - 1] ?? `Day ${day}`;
+// Merge schedules returned by move/swap responses into the existing full list
+// by id — responses only carry the affected schedules and must never replace
+// the whole grid.
+const mergeScheduleUpdates = (prev: ScheduleResponse[] | null | undefined, updates: ScheduleResponse[] | null | undefined) => {
+  const list = prev ?? [];
+  const byId = new Map(list.map((s) => [s.scheduleId, s]));
+  for (const s of updates ?? []) byId.set(s.scheduleId, s);
+  return [...byId.values()];
+};
 const slotTextOf = (s: ScheduleResponse) =>
   `${dayNameOf(s.dayOfWeek)} P${s.startPeriodNo}${s.endPeriodNo > s.startPeriodNo ? '-' + s.endPeriodNo : ''}`;
 const meetingLabelOf = (s: ScheduleResponse) => {
-  const meta = SCHEDULE_TYPE_META[s.scheduleType] ?? SCHEDULE_TYPE_META.COURSE;
+  const isLab = s.scheduleType === 'COURSE' && s.meetingType === 'LAB';
+  const meta = SCHEDULE_TYPE_META[isLab ? 'LAB' : s.scheduleType] ?? SCHEDULE_TYPE_META.COURSE;
   const span = s.endPeriodNo - s.startPeriodNo + 1;
   return `${meta.label} \u2014 ${span} period${span === 1 ? '' : 's'}`;
 };
@@ -1434,26 +1537,242 @@ function ElectiveCard({ items, onClick }: { items: ScheduleResponse[]; onClick?:
   );
 }
 
+/**
+ * Compact Mon–Fri × P1–P6 weekly mini grid. Pass a filtered schedule list and
+ * it renders only those sessions (a single course, or a lecturer's whole week).
+ * Cells are static (no drag); each spanned cell carries a descriptive tooltip.
+ */
+function MiniTimetable({ schedules }: { schedules: ScheduleResponse[] }) {
+  const PERIODS = [1, 2, 3, 4, 5, 6];
+  const MINI_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
+
+  // Non-overlapping sessions per day (a duplicate slot keeps the first).
+  const placed = useMemo(() => {
+    const list = schedules
+      .filter((s) => s.dayOfWeek >= 1 && s.dayOfWeek <= 5 && s.scheduleType === 'COURSE')
+      .sort((a, b) => a.dayOfWeek - b.dayOfWeek || a.startPeriodNo - b.startPeriodNo);
+    const result: ScheduleResponse[] = [];
+    for (const s of list) {
+      const start = Math.max(1, s.startPeriodNo);
+      const end = Math.min(6, s.endPeriodNo);
+      const overlaps = result.some(
+        (o) =>
+          o.dayOfWeek === s.dayOfWeek &&
+          Math.max(1, o.startPeriodNo) <= end &&
+          Math.min(6, o.endPeriodNo) >= start
+      );
+      if (overlaps) continue;
+      result.push(s);
+    }
+    return result;
+  }, [schedules]);
+
+  const startsByDay = useMemo(() => {
+    const map = new Map<number, ScheduleResponse[]>();
+    for (const s of placed) {
+      const arr = map.get(s.dayOfWeek) ?? [];
+      arr.push(s);
+      map.set(s.dayOfWeek, arr);
+    }
+    return map;
+  }, [placed]);
+
+  // Continuation periods are consumed by the single spanning cell.
+  const coveredByDay = useMemo(() => {
+    const map = new Map<number, Set<number>>();
+    for (const s of placed) {
+      const start = Math.max(1, s.startPeriodNo);
+      const end = Math.min(6, s.endPeriodNo);
+      let set = map.get(s.dayOfWeek);
+      if (!set) {
+        set = new Set<number>();
+        map.set(s.dayOfWeek, set);
+      }
+      for (let p = start + 1; p <= end; p++) set.add(p);
+    }
+    return map;
+  }, [placed]);
+
+  const cardStyle = (s: ScheduleResponse) => {
+    const meta = SCHEDULE_TYPE_META[s.scheduleType] ?? SCHEDULE_TYPE_META.COURSE;
+    return {
+      background: meta.cardBg,
+      border: meta.cardBorder,
+      color: meta.fg,
+    };
+  };
+
+  return (
+    <div className="w-full">
+      <div style={{ display: 'grid', gridTemplateColumns: '36px repeat(6, minmax(0, 1fr))', gap: 3, marginBottom: 3 }}>
+        <div />
+        {PERIODS.map((p) => (
+          <div
+            key={p}
+            style={{ fontSize: 9.5, fontWeight: 800, color: 'var(--text-lighter)', textAlign: 'center', letterSpacing: '0.3px' }}
+          >
+            P{p}
+          </div>
+        ))}
+      </div>
+      {MINI_DAYS.map((label, di) => {
+        const day = di + 1;
+        return (
+          <div key={day} style={{ display: 'grid', gridTemplateColumns: '36px repeat(6, minmax(0, 1fr))', gap: 3, marginBottom: 3 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-light)', display: 'flex', alignItems: 'center' }}>
+              {label}
+            </div>
+            {PERIODS.map((p) => {
+              // Continuation period — already covered by the session's spanning cell.
+              if (coveredByDay.get(day)?.has(p)) return null;
+              const s = startsByDay.get(day)?.find((x) => x.startPeriodNo === p);
+              if (!s) {
+                return (
+                  <div
+                    key={p}
+                    style={{ minHeight: 30, borderRadius: 6, border: '1px solid var(--surface-border)', background: 'var(--secondary-lighter)' }}
+                  />
+                );
+              }
+              const spanEnd = Math.min(6, s.endPeriodNo);
+              const sectionLabel = (s.sections?.length ? s.sections : s.sectionName ? [s.sectionName] : []).join(' + ') || '';
+              const staff = s.staffNames.length > 0 ? s.staffNames.join(', ') : s.staffName || '';
+              const meta = SCHEDULE_TYPE_META[s.scheduleType] ?? SCHEDULE_TYPE_META.COURSE;
+              const tooltip = `${s.courseCode} \u00b7 ${s.courseName}\n${meta.label}${sectionLabel ? ' \u00b7 Sec ' + sectionLabel : ''}${staff ? ' \u00b7 ' + staff : ''}\n${slotTextOf(s)}`;
+              return (
+                <div
+                  key={p}
+                  title={tooltip}
+                  style={{
+                    gridColumn: `${p + 1} / ${spanEnd + 2}`,
+                    minHeight: 30,
+                    borderRadius: 6,
+                    border: cardStyle(s).border,
+                    background: cardStyle(s).background,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '2px 3px',
+                    overflow: 'hidden',
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 9.5,
+                      fontWeight: 800,
+                      color: cardStyle(s).color,
+                      lineHeight: 1.1,
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      maxWidth: '100%',
+                    }}
+                  >
+                    {s.courseCode}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function WeeklyGridSkeleton() {
+  return (
+    <div className="w-full overflow-x-auto" role="status" aria-label="Loading timetable">
+      <table className="table" style={{ borderRadius: 'var(--radius-lg)' }}>
+        <thead>
+          <tr>
+            <th style={{ width: 96 }}><div className="skeleton h-4 w-14" /></th>
+            {GRID_COLUMN_HEADERS.map((h) => (
+              <th key={h}><div className="skeleton h-4 w-10" /></th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {GRID_DAY_NAMES.map((dayName, di) => (
+            <tr key={dayName}>
+              <th><div className="skeleton h-4 w-16" /></th>
+              {GRID_COLUMN_HEADERS.map((h, ci) => {
+                const period = periodOfColumn(ci);
+                if (h === 'LUNCH') {
+                  return (
+                    <td key={`${dayName}-lunch`}>
+                      <div className="skeleton mx-auto" style={{ width: 10, height: '56px' }} />
+                    </td>
+                  );
+                }
+                const show = (di * 7 + period) % 2 === 0;
+                return (
+                  <td key={`${dayName}-${period}`} className="px-1.5">
+                    {show ? (
+                      <div className="skeleton" style={{ width: '100%', height: '64px' }} />
+                    ) : (
+                      <div className="skeleton" style={{ width: '55%', height: '24px', margin: '0 auto' }} />
+                    )}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 interface WeeklyTimetableGridProps {
   schedules: ScheduleResponse[];
   editable: boolean;
   periodLabels: string[];
   lunchLabel: string;
   todayIdx?: number;
-  dragTarget?: { day: number; period: number } | null;
+  /**
+   * The caller has already scoped `schedules` to ONE cohort (semester +
+   * section). Combined-section rows then legitimately list other sections in
+   * their `sections` array, so the grid must NOT re-split them into phantom
+   * sibling cohort tables — render a single grid and info panel.
+   */
+  asSingleCohort?: boolean;
+  dragTarget?: { day: number; period: number; span?: number } | null;
   remoteDrag?: RemoteDragState | null;
+  dragMode?: 'consecutive' | 'single';
   onDragOver?: (e: DragEvt<HTMLDivElement>, day: number, period: number) => void;
   onDrop?: (e: DragEvt<HTMLDivElement>, day: number, period: number) => void;
-  onDragStart?: (e: DragEvt<HTMLDivElement>, schedule: ScheduleResponse) => void;
+  onDragStart?: (e: DragEvt<HTMLDivElement>, schedule: ScheduleResponse, anchorPeriod: number) => void;
   onDragEnd?: () => void;
   onSelectSchedule?: (schedule: ScheduleResponse) => void;
   onSelectElectives?: (items: ScheduleResponse[]) => void;
   onCellClick?: (day: number, period: number) => void;
-}
+}const periodOfColumn = (ci: number) => (ci < LUNCH_HEADER_COL ? ci + 1 : ci);
 
-const periodOfColumn = (ci: number) => (ci < LUNCH_HEADER_COL ? ci + 1 : ci);
+/** Grid column of a period: P1–P3 map to columns 2–4, P4–P6 to 6–8 (lunch is column 5). */
+const colIndexOf = (period: number) => (period <= 3 ? period + 1 : period + 2);
 
-const windowKeyOf = (s: ScheduleResponse) => `${s.startPeriodNo}|${s.endPeriodNo}`;
+/**
+ * Visual segments of a session for grid-column spanning. Sessions that cross
+ * lunch render as two segments (before + after lunch); all others render as one
+ * continuous segment that occupies every period in the window.
+ */
+const segmentListOf = (s: ScheduleResponse): [number, number][] =>
+  s.startPeriodNo <= 3 && s.endPeriodNo >= 4
+    ? [[s.startPeriodNo, 3], [4, s.endPeriodNo]]
+    : [[s.startPeriodNo, s.endPeriodNo]];
+
+/**
+ * Identity of one teaching session so split halves (created by single-cell
+ * swaps) can be re-joined visually. Group sessions share a group id, plain
+ * sessions share an assignment id; fall back to course+section only when a
+ * schedule carries neither.
+ */
+const sessionKeyOf = (s: ScheduleResponse): string => {
+  if (s.teachingGroupId) return `g:${s.teachingGroupId}`;
+  if (s.teachingAssignmentId) return `a:${s.teachingAssignmentId}`;
+  return `c:${s.courseCode}|${(s.sections ?? []).join(',')}|${s.sectionName ?? ''}`;
+};
 
 /**
  * Grouping key for the timetable presentation: semester + section + weekday +
@@ -1463,10 +1782,12 @@ const windowKeyOf = (s: ScheduleResponse) => `${s.startPeriodNo}|${s.endPeriodNo
 const groupSchedulesByCohort = (schedules: ScheduleResponse[]): { semesterNo: number; section: string; items: ScheduleResponse[] }[] => {
   const map = new Map<string, { semesterNo: number; section: string; items: ScheduleResponse[] }>();
   for (const s of schedules) {
-    const semesterNo = s.semesterNo ?? 0;
-    const sections = (s.sections && s.sections.length > 0 ? s.sections : s.sectionName ? [s.sectionName] : [])
-      .map((x) => String(x).trim())
-      .filter(Boolean);
+    const semesterNo = typeof s.semesterNo === 'number' ? s.semesterNo : Number(s.semesterNo ?? 0);
+    const sections = Array.from(new Set(
+      (s.sections && s.sections.length > 0 ? s.sections : s.sectionName ? [s.sectionName] : [])
+        .map((x) => String(x).trim())
+        .filter(Boolean)
+    ));
     for (const section of sections) {
       const key = `${semesterNo}|${section}`;
       const group = map.get(key) ?? { semesterNo, section, items: [] };
@@ -1479,8 +1800,10 @@ const groupSchedulesByCohort = (schedules: ScheduleResponse[]): { semesterNo: nu
   // in EVERY cohort table whose courses do not already occupy their slot -
   // that is exactly the slot the solver verified as free for that section.
   // Fillers must never CREATE a cohort table, only join existing ones.
+  // BREAK fillers are intentionally omitted: only LMS and Assignment show in
+  // free cells.
   for (const s of schedules) {
-    if (s.scheduleType === 'COURSE') continue;
+    if (s.scheduleType === 'COURSE' || s.scheduleType === 'BREAK') continue;
     for (const group of map.values()) {
       const occupied = group.items.some((c) =>
         c.scheduleType === 'COURSE' &&
@@ -1503,6 +1826,8 @@ function WeeklyTimetableGrid({
   todayIdx = -1,
   dragTarget = null,
   remoteDrag = null,
+  dragMode = 'consecutive',
+  asSingleCohort = false,
   onDragOver,
   onDrop,
   onDragStart,
@@ -1511,7 +1836,10 @@ function WeeklyTimetableGrid({
   onSelectElectives,
   onCellClick,
 }: WeeklyTimetableGridProps) {
-  const groups = useMemo(() => groupSchedulesByCohort(schedules), [schedules]);
+  const groups = useMemo(
+    () => (asSingleCohort ? [] : groupSchedulesByCohort(schedules)),
+    [schedules, asSingleCohort]
+  );
 
   const renderCohortGrid = (items: ScheduleResponse[]) => (
     <div style={{ display: 'grid', gap: 1, minWidth: 940, gridTemplateColumns: GRID_COLUMNS }}>
@@ -1560,6 +1888,57 @@ function WeeklyTimetableGrid({
       {GRID_DAY_NAMES.map((dayName, di) => {
         const day = di + 1;
         const isToday = di === todayIdx;
+        const daySpanStarts = new Map<number, { s: ScheduleResponse; segEnd: number }[]>();
+        const dayCovered = new Set<number>();
+        const dayContinuers = new Map<number, ScheduleResponse[]>();
+        for (const ss of items) {
+          if (ss.dayOfWeek !== day) continue;
+          for (const [segStart, segEnd] of segmentListOf(ss)) {
+            const arr = daySpanStarts.get(segStart) ?? [];
+            arr.push({ s: ss, segEnd });
+            daySpanStarts.set(segStart, arr);
+            for (let p = segStart + 1; p <= segEnd; p++) {
+              dayCovered.add(p);
+              if (dragMode === 'single') {
+                const contArr = dayContinuers.get(p) ?? [];
+                contArr.push(ss);
+                dayContinuers.set(p, contArr);
+              }
+            }
+          }
+        }
+        // Block view re-joins adjacent single-cell halves of the SAME session
+        // (e.g. an M-1101 split into P3 + P2 by a single-cell swap) into one
+        // consecutive cell, so two same-course cells side by side read as what
+        // they really are. The lunch boundary (P3 | P4) is never merged — those
+        // two cells stay visually separate even though the periods are adjacent.
+        const mergedStarts = new Map<number, number>();
+        const mergedCovered = new Set<number>();
+        if (dragMode !== 'single') {
+          for (const [segLo, segHi] of [[1, 3], [4, 6]] as const) {
+            for (let p = segLo; p <= segHi; p++) {
+              if (mergedCovered.has(p)) continue;
+              const startRow = daySpanStarts.get(p);
+              if (!startRow || startRow.length !== 1) continue;
+              const row = startRow[0].s;
+              if (row.courseCode == null || row.startPeriodNo !== row.endPeriodNo) continue;
+              let end = p;
+              while (end < segHi) {
+                const next = daySpanStarts.get(end + 1);
+                if (!next || next.length !== 1) break;
+                const n = next[0].s;
+                if (n.courseCode == null || n.courseCode !== row.courseCode) break;
+                if (n.startPeriodNo !== n.endPeriodNo) break;
+                if (sessionKeyOf(n) !== sessionKeyOf(row)) break;
+                end++;
+              }
+              if (end > p) {
+                mergedStarts.set(p, end);
+                for (let q = p + 1; q <= end; q++) mergedCovered.add(q);
+              }
+            }
+          }
+        }
         return (
           <Fragment key={dayName}>
             <div
@@ -1597,19 +1976,134 @@ function WeeklyTimetableGrid({
             {GRID_COLUMN_HEADERS.map((h, ci) => {
               const period = periodOfColumn(ci);
               if (h === 'LUNCH') return null;
-              const cellSchedules = items.filter(
-                (s) =>
-                  s.dayOfWeek === day &&
-                  (s.startPeriodNo === period ||
-                    (period === 4 && s.startPeriodNo <= 3 && s.endPeriodNo >= 4))
-              );
-              const spannedInto = items.some((s) => {
-                if (s.dayOfWeek !== day) return false;
-                const segEnd = s.startPeriodNo <= 3 && s.endPeriodNo >= 4 ? 3 : s.endPeriodNo;
-                return s.startPeriodNo < period && segEnd >= period;
-              });
-              const isTarget = dragTarget?.day === day && dragTarget.period === period;
+              // Continuation periods of a multi-period session are consumed by the
+              // one continuous cell that spans them — no separate cell is rendered.
+              // In single-cell drag mode they become their own single cell instead.
+              if (mergedCovered.has(period)) return null;
+              if (dayCovered.has(period)) {
+                if (dragMode !== 'single') return null;
+                const continuers = dayContinuers.get(period);
+                if (!continuers || continuers.length === 0) return null;
+                const contTarget = dragTarget?.day === day && dragTarget.period === period;
+                const contRemote = remoteDrag?.day === day && remoteDrag.period === period;
+                return (
+                  <div
+                    key={`${day}-${period}`}
+                    onDragOver={onDragOver ? (e) => onDragOver(e, day, period) : undefined}
+                    onDrop={onDrop ? (e) => onDrop(e, day, period) : undefined}
+                    onClick={onCellClick ? () => onCellClick(day, period) : undefined}
+                    style={{
+                      gridColumn: `${colIndexOf(period)} / ${colIndexOf(period) + 1}`,
+                      gridRow: di + 2,
+                      minHeight: GRID_CELL_MIN_HEIGHT,
+                      minWidth: 0,
+                      borderRadius: 6,
+                      borderStyle: 'dashed',
+                      borderWidth: '1.5px',
+                      borderColor: contTarget ? 'var(--primary)' : 'var(--surface-border)',
+                      background: contTarget ? 'rgba(40,114,161,0.12)' : 'var(--secondary-lighter)',
+                      padding: 5,
+                      position: 'relative',
+                      zIndex: contTarget ? 3 : 1,
+                      overflow: 'visible',
+                    }}
+                  >
+                    {contRemote && (
+                      <div
+                        className="animate-pulse"
+                        style={{ position: 'absolute', top: 4, right: 4, zIndex: 4, width: 8, height: 8, borderRadius: '50%', background: '#8b5cf6' }}
+                      />
+                    )}
+                    <div style={{ display: 'flex', flexDirection: 'row', gap: 1, height: '100%' }}>
+                      {continuers.map((s) => (
+                        <div key={`${day}-${period}-${s.scheduleId}`} style={{ flex: '1 1 0%', minWidth: 0, position: 'relative' }}>
+                          <ScheduleCard
+                            schedule={s}
+                            editable={editable}
+                            partPeriod={period}
+                            onDragStart={onDragStart ? (e) => onDragStart(e, s, period) : undefined}
+                            onDragEnd={onDragEnd}
+                            onClick={onSelectSchedule ? () => onSelectSchedule(s) : undefined}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              }
+              const groupStarts = daySpanStarts.get(period);
+              const isTarget =
+                dragTarget?.day === day &&
+                period >= (dragTarget.period ?? 0) &&
+                period <= (dragTarget.period ?? 0) + (dragTarget.span ?? 1) - 1;
               const remoteHere = remoteDrag?.day === day && remoteDrag.period === period;
+              if (groupStarts) {
+                const segEnd = mergedStarts.has(period)
+                  ? mergedStarts.get(period)!
+                  : Math.max(...groupStarts.map((x) => x.segEnd));
+                const combined =
+                  groupStarts.length > 1 &&
+                  new Set(groupStarts.map((x) => x.s.courseCode)).size === groupStarts.length;
+                // In single-cell mode a co-located elective cluster is also
+                // splittable: each course renders as its own draggable part
+                // (P1 included) instead of the combined ElectiveCard frame.
+                const showCombinedFrame =
+                  combined && dragMode === 'consecutive';
+                return (
+                  <div
+                    key={`${day}-${period}`}
+                    onDragOver={onDragOver ? (e) => onDragOver(e, day, period) : undefined}
+                    onDrop={onDrop ? (e) => onDrop(e, day, period) : undefined}
+                    onClick={onCellClick ? () => onCellClick(day, period) : undefined}
+                    style={{
+                      gridColumn:
+                        dragMode === 'single'
+                          ? `${colIndexOf(period)} / ${colIndexOf(period) + 1}`
+                          : `${colIndexOf(period)} / ${colIndexOf(segEnd) + 1}`,
+                      gridRow: di + 2,
+                      minHeight: GRID_CELL_MIN_HEIGHT,
+                      minWidth: 0,
+                      borderRadius: 6,
+                      borderStyle: 'solid',
+                      borderWidth: '1.5px',
+                      borderColor: isTarget ? 'var(--primary)' : 'var(--surface-border)',
+                      background: isTarget ? 'rgba(40,114,161,0.12)' : 'var(--secondary-lighter)',
+                      padding: 5,
+                      position: 'relative',
+                      zIndex: isTarget ? 3 : 1,
+                      overflow: 'visible',
+                    }}
+                  >
+                    {remoteHere && (
+                      <div
+                        className="animate-pulse"
+                        style={{ position: 'absolute', top: 4, right: 4, zIndex: 4, width: 8, height: 8, borderRadius: '50%', background: '#8b5cf6' }}
+                      />
+                    )}
+                    {showCombinedFrame ? (
+                      <ElectiveCard
+                        items={groupStarts.map((x) => x.s)}
+                        onClick={onSelectElectives ? () => onSelectElectives(groupStarts.map((x) => x.s)) : undefined}
+                      />
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'row', gap: 1, height: '100%' }}>
+                        {groupStarts.map(({ s }) => (
+                          <div key={s.scheduleId} style={{ flex: '1 1 0%', minWidth: 0, position: 'relative' }}>
+                            <ScheduleCard
+                              schedule={s}
+                              editable={editable}
+                              partPeriod={dragMode === 'single' && s.endPeriodNo > s.startPeriodNo ? s.startPeriodNo : undefined}
+                              onDragStart={onDragStart ? (e) => onDragStart(e, s, s.startPeriodNo) : undefined}
+                              onDragEnd={onDragEnd}
+                              onClick={onSelectSchedule ? () => onSelectSchedule(s) : undefined}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              }
               return (
                 <div
                   key={`${day}-${period}`}
@@ -1624,15 +2118,11 @@ function WeeklyTimetableGrid({
                     borderRadius: 6,
                     borderStyle: 'solid',
                     borderWidth: '1.5px',
-                    borderColor: spannedInto
-                      ? 'transparent'
-                      : isTarget
-                        ? 'var(--primary)'
-                        : 'var(--surface-border)',
-                    background: spannedInto ? 'transparent' : isTarget ? 'rgba(40,114,161,0.12)' : 'var(--secondary-lighter)',
+                    borderColor: isTarget ? 'var(--primary)' : 'var(--surface-border)',
+                    background: isTarget ? 'rgba(40,114,161,0.12)' : 'var(--secondary-lighter)',
                     padding: 5,
                     position: 'relative',
-                    zIndex: spannedInto ? 3 : 1,
+                    zIndex: isTarget ? 3 : 1,
                     overflow: 'visible',
                   }}
                 >
@@ -1642,60 +2132,58 @@ function WeeklyTimetableGrid({
                       style={{ position: 'absolute', top: 4, right: 4, zIndex: 4, width: 8, height: 8, borderRadius: '50%', background: '#8b5cf6' }}
                     />
                   )}
-                  {[...cellSchedules]
-                    .sort((a, b) => windowKeyOf(a).localeCompare(windowKeyOf(b)))
-                    .reduce((groups, s) => {
-                      const last = groups[groups.length - 1];
-                      if (last && windowKeyOf(last[0]) === windowKeyOf(s)) last.push(s);
-                      else groups.push([s]);
-                      return groups;
-                    }, [] as ScheduleResponse[][])
-                    .map((grp, gi) => {
-                      const s = grp[0];
-                      const combined = grp.length > 1 && new Set(grp.map((x) => x.courseCode)).size === grp.length;
-                      const crossesLunch = s.startPeriodNo <= 3 && s.endPeriodNo >= 4;
-                      const isContinuation = period === 4 && s.startPeriodNo <= 3 && crossesLunch;
-                      const span = isContinuation
-                        ? s.endPeriodNo - 4 + 1
-                        : crossesLunch
-                          ? 3 - s.startPeriodNo + 1
-                          : s.endPeriodNo - s.startPeriodNo + 1;
-                      return (
-                        <div
-                          key={s.scheduleId}
-                          style={{
-                            position: 'absolute',
-                            top: 5,
-                            bottom: 5,
-                            left: 5 + gi * 14,
-                            width: `calc(${span * 100}% + ${(span - 1) * 1}px - 10px - ${gi * 14}px)`,
-                            zIndex: 10 + gi,
-                            pointerEvents: 'none',
-                          }}
-                        >
-                          {combined ? (
-                            <ElectiveCard
-                              items={grp}
-                              onClick={onSelectElectives ? () => onSelectElectives(grp) : undefined}
-                            />
-                          ) : (
-                            <ScheduleCard
-                              schedule={s}
-                              editable={editable}
-                              onDragStart={onDragStart ? (e) => onDragStart(e, s) : undefined}
-                              onDragEnd={onDragEnd}
-                              onClick={onSelectSchedule ? () => onSelectSchedule(s) : undefined}
-                            />
-                          )}
-                        </div>
-                      );
-                    })},
                 </div>
               );
             })},
           </Fragment>
         );
       })},
+
+      {/* Remote drag: the exact schedule cell another HOD is dragging, live. */}
+      {remoteDrag?.schedule && remoteDrag.day != null && remoteDrag.period != null && (() => {
+        const s = remoteDrag.schedule;
+        const span = dragMode === 'single' ? 1 : s.endPeriodNo - s.startPeriodNo + 1;
+        const endPeriod = Math.min(
+          remoteDrag.period + span - 1,
+          remoteDrag.period <= 3 ? 3 : MAX_PERIOD
+        );
+        return (
+          <div
+            className="animate-pulse"
+            style={{
+              gridColumn: `${colIndexOf(remoteDrag.period)} / ${colIndexOf(endPeriod) + 1}`,
+              gridRow: remoteDrag.day + 1,
+              zIndex: 40,
+              pointerEvents: 'none',
+              position: 'relative',
+              minHeight: GRID_CELL_MIN_HEIGHT,
+              padding: 3,
+              borderRadius: 'var(--radius-md)',
+              border: '2px dashed #8b5cf6',
+              background: 'rgba(139,92,246,0.12)',
+              boxSizing: 'border-box',
+            }}
+          >
+            <ScheduleCard schedule={s} editable={false} />
+            <span
+              className="badge badge-xs"
+              style={{
+                position: 'absolute',
+                top: -8,
+                right: 6,
+                zIndex: 41,
+                background: '#8b5cf6',
+                color: '#fff',
+                border: 'none',
+                fontWeight: 700,
+                letterSpacing: '0.3px',
+              }}
+            >
+              {remoteDrag.staffName}
+            </span>
+          </div>
+        );
+      })()}
 
       {/* Lunch strip */}
       <div
@@ -1869,6 +2357,12 @@ interface SharedTimetableWorkspaceProps {
   onBack: () => void;
   /** Called when the session genuinely does not exist after bounded retries. */
   onNotFound?: (generationId: string) => void;
+  /**
+   * When provided, the workspace is locked to exactly one generated section's
+   * timetable (Semester + Section). The filter dropdowns and generation scope
+   * panel are hidden and only that cohort's grid is shown.
+   */
+  initialSectionScope?: { semesterNo: number; section: string } | null;
   staff: StaffRecord;
 }
 
@@ -1940,7 +2434,10 @@ export function RollCallWorkspace() {
   );
 }
 
-export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, staff }: SharedTimetableWorkspaceProps) {
+export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, initialSectionScope = null, staff }: SharedTimetableWorkspaceProps) {
+  const router = useRouter();
+  const lastEditStartRef = useRef<string | null>(null);
+  const sectionScope = initialSectionScope;
   const [generation, setGeneration] = useState<GenerationSessionResponse | null>(null);
   const [lobby, setLobby] = useState<TimetableLobbyResponse | null>(null);
   const [manage, setManage] = useState<GenerationManageResponse | null>(null);
@@ -1948,6 +2445,9 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
   const [examTypes, setExamTypes] = useState<ExamTypeResponse[]>([]);
   const [schedules, setSchedules] = useState<ScheduleResponse[] | null>(null);
   const [status, setStatus] = useState<GenerationStatus>('PENDING');
+  const [snapshotStatus, setSnapshotStatus] = useState<'SNAPSHOT_PREPARING' | 'SNAPSHOT_READY' | 'SNAPSHOT_INVALID' | 'SNAPSHOT_ERROR' | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const [snapshotPreparing, setSnapshotPreparing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [selectedExamType, setSelectedExamType] = useState('');
@@ -1958,11 +2458,23 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
   const [scopeLoading, setScopeLoading] = useState(false);
   const [lock, setLock] = useState<TimetableLockResponse | null>(null);
   const [remoteDrag, setRemoteDrag] = useState<RemoteDragState | null>(null);
-  const [dragTarget, setDragTarget] = useState<{ day: number; period: number } | null>(null);
+  const [dragTarget, setDragTarget] = useState<{ day: number; period: number; span?: number } | null>(null);
+  // How a dragged multi-period session is placed:
+  //  'consecutive' - the block stays one spanning cell and drops as its full
+  //    consecutive span (drag two -> two cells, drag one -> one cell).
+  //  'single' - each period of the session is drawn as its own draggable cell;
+  //    grabbing P1 or P2 moves the session so the grabbed cell lands on the
+  //    drop cell and the other period follows adjacent (the backend always
+  //    keeps the pair together, so this splits the drag handle, not the data).
+  const [dragMode, setDragMode] = useState<'consecutive' | 'single'>('consecutive');
+  const dragSpanRef = useRef(1);
   const [pendingSwap, setPendingSwap] = useState<PendingSwapState | null>(null);
   const [selectedMeeting, setSelectedMeeting] = useState<ScheduleResponse | null>(null);
+  const [lecturerDetail, setLecturerDetail] = useState<string | null>(null);
   const [electivePick, setElectivePick] = useState<ScheduleResponse[] | null>(null);
   const [moveTarget, setMoveTarget] = useState<ScheduleResponse | null>(null);
+  const [undoStack, setUndoStack] = useState<EditOp[]>([]);
+  const [redoStack, setRedoStack] = useState<EditOp[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -1979,6 +2491,12 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
   const [groupCourseId, setGroupCourseId] = useState('');
   const [groupAssignments, setGroupAssignments] = useState<Set<string>>(new Set());
   const [groupsSaving, setGroupsSaving] = useState(false);
+  const [groupsTab, setGroupsTab] = useState<'myUnit' | 'allUnits'>('myUnit');
+  const [groupsUnitFilter, setGroupsUnitFilter] = useState('all');
+  const [groupsSemFilter, setGroupsSemFilter] = useState('all');
+  const [addToGroupId, setAddToGroupId] = useState('');
+  const [addGroupAssignments, setAddGroupAssignments] = useState<Set<string>>(new Set());
+  const [addGroupsSaving, setAddGroupsSaving] = useState(false);
   const [, setGenerationTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
   const isHod = manage?.isHod === true;
@@ -2005,6 +2523,42 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
     setSchedules(list);
   }, [generationId]);
 
+  // Prepare (or reuse) the backend snapshot owned by this generationId. Runs in
+  // the background so the workspace renders immediately on entry; the Generate
+  // button is gated until the snapshot is READY. On refresh/reconnect this
+  // simply re-fetches the already-prepared backend state (reuse, no rebuild).
+  //
+  // State model (single source of truth derived from the backend):
+  //   PREPARING -> error=null, generateDisabled=true
+  //   READY     -> error=null, generateDisabled=false
+  //   ERROR     -> error=real message, generateDisabled=true
+  // The preparation error is cleared on every non-error transition so a stale
+  // "Could not prepare" can never keep Generate disabled after backend READY.
+  const loadSnapshot = useCallback(async () => {
+    setSnapshotStatus('SNAPSHOT_PREPARING');
+    setSnapshotPreparing(true);
+    setSnapshotError(null);
+    try {
+      const snap = await prepareSnapshot(generationId);
+      setSnapshotStatus(snap.status);
+      if (snap.status === 'SNAPSHOT_READY') {
+        setSnapshotError(null);
+      }
+    } catch (e) {
+      setSnapshotStatus('SNAPSHOT_ERROR');
+      setSnapshotError(e instanceof Error ? e.message : 'Could not prepare timetable data');
+    } finally {
+      setSnapshotPreparing(false);
+    }
+  }, [generationId]);
+
+  // Manual recovery: re-runs prepareSnapshot. The backend is authoritative —
+  // existing snapshot is reused, a missing one is created. Clears the old error
+  // as soon as the backend reports READY (TEST4).
+  const retrySnapshot = useCallback(() => {
+    loadSnapshot();
+  }, [loadSnapshot]);
+
   const scheduleGenerationFallback = useCallback(() => {
     clearGenerationTimer();
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -2022,6 +2576,12 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
             timer = setTimeout(tick, GENERATION_FALLBACK_MS);
             setGenerationTimer(timer);
           }
+        } else {
+          // Generation finished but the realtime stream may have missed the
+          // completion event (e.g. SSE connected mid-generation). Pull the
+          // schedules so the grid appears without a hard refresh.
+          clearGenerationTimer();
+          refreshSchedules().catch(() => {});
         }
       } catch {
         timer = setTimeout(tick, GENERATION_FALLBACK_MS);
@@ -2030,7 +2590,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
     }
     timer = setTimeout(tick, GENERATION_FALLBACK_MS);
     setGenerationTimer(timer);
-  }, [generationId, clearGenerationTimer]);
+  }, [generationId, clearGenerationTimer, refreshSchedules]);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -2062,7 +2622,16 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
       const [et, lobbies] = await Promise.all([getExamTypes(), getGenerationLobbies()]);
       setGeneration(gen);
       setStatus(gen.status);
+      if (gen.status === 'GENERATING') {
+        // Entering a workspace mid-generation: the SSE start event may already
+        // be gone, so seed the polling fallback now. It also pulls the final
+        // schedules the moment generation finishes, no refresh required.
+        scheduleGenerationFallback();
+      }
       setExamTypes(et);
+      // Kick off (non-blocking) snapshot preparation/reuse for this generationId
+      // so the workspace renders immediately and Generate stays gated until READY.
+      loadSnapshot();
       const initialExamTypeId = et[0]?.examTypeId ?? '';
       setSelectedExamType(initialExamTypeId);
       const [mg, sc, sch] = await Promise.all([
@@ -2086,7 +2655,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
     } finally {
       setLoading(false);
     }
-  }, [generationId]);
+  }, [generationId, loadSnapshot, scheduleGenerationFallback]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial workspace load
@@ -2095,7 +2664,35 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
 
   useEffect(() => () => clearGenerationTimer(), [clearGenerationTimer]);
 
-  useTimetableRealtime(lobby?.lobbyId ?? null, (event) => {
+  // Drive the snapshot toward READY on workspace entry. A "missing" snapshot
+  // (status null/INVALID) is recovered by calling the authoritative POST
+  // prepareSnapshot, never by showing a permanent error. A transient SNAPSHOT_ERROR
+  // is self-healed with a single delayed auto-retry; a persistent one exposes a
+  // manual "Try again" so the user is never permanently locked out.
+  const snapshotRetryRef = useRef(0);
+  useEffect(() => {
+    if (snapshotPreparing) return;
+    if (snapshotStatus === 'SNAPSHOT_PREPARING') return;
+    if (snapshotStatus === 'SNAPSHOT_READY') {
+      snapshotRetryRef.current = 0;
+      return;
+    }
+    if (snapshotStatus === 'SNAPSHOT_ERROR') {
+      if (snapshotRetryRef.current === 0) {
+        snapshotRetryRef.current += 1;
+        const t = setTimeout(() => loadSnapshot(), 1500);
+        return () => clearTimeout(t);
+      }
+      return;
+    }
+    // null (initial) or SNAPSHOT_INVALID -> recover by preparing.
+    if (snapshotRetryRef.current < 3) {
+      snapshotRetryRef.current += 1;
+      loadSnapshot();
+    }
+  }, [snapshotStatus, snapshotPreparing, loadSnapshot]);
+
+  useTimetableRealtimeGeneration(generationId, (event) => {
     if (event.generationId && event.generationId !== generationId) return;
     pushEvent(setHistory, event.type);
     switch (event.type) {
@@ -2104,6 +2701,24 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
         setSaving(false);
         setSaveError(null);
         scheduleGenerationFallback();
+        break;
+      case TIMETABLE_REALTIME_EVENTS.SNAPSHOT_STATE:
+        if (
+          event.snapshotStatus === 'SNAPSHOT_READY' ||
+          event.snapshotStatus === 'SNAPSHOT_PREPARING' ||
+          event.snapshotStatus === 'SNAPSHOT_INVALID' ||
+          event.snapshotStatus === 'SNAPSHOT_ERROR'
+        ) {
+          if (event.snapshotStatus === 'SNAPSHOT_ERROR') {
+            setSnapshotStatus('SNAPSHOT_ERROR');
+            setSnapshotError(event.snapshotError as string | undefined ?? 'Could not prepare timetable data');
+          } else {
+            setSnapshotStatus(event.snapshotStatus);
+            // Any non-error realtime state clears a stale preparation error, so a
+            // previously shown "Could not prepare" cannot persist after recovery.
+            setSnapshotError(null);
+          }
+        }
         break;
       case TIMETABLE_REALTIME_EVENTS.GENERATION_COMPLETED:
         setStatus('COMPLETED');
@@ -2145,29 +2760,48 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
         break;
       case TIMETABLE_REALTIME_EVENTS.SCHEDULE_UNLOCKED:
         setLock((prev) =>
-          prev && prev.staffId === staff.staffId
-            ? { ...prev, locked: false, staffId: null, staffName: null, expiresAt: null }
-            : prev
+          prev ? { ...prev, locked: false, staffId: null, staffName: null, expiresAt: null } : prev
         );
         break;
       case TIMETABLE_REALTIME_EVENTS.DRAG_STARTED:
-      case TIMETABLE_REALTIME_EVENTS.DRAG_MOVED:
         if (event.staffId && event.staffId !== staff.staffId) {
           setRemoteDrag({
             scheduleId: event.scheduleId ?? '',
             staffName: event.staffName ?? 'Another editor',
             day: event.day ?? null,
             period: event.period ?? null,
+            schedule: (schedules ?? []).find((s) => s.scheduleId === event.scheduleId) ?? null,
           });
+        }
+        break;
+      case TIMETABLE_REALTIME_EVENTS.DRAG_MOVED:
+        if (event.staffId && event.staffId !== staff.staffId) {
+          setRemoteDrag((prev) =>
+            prev
+              ? { ...prev, staffName: event.staffName ?? prev.staffName, day: event.day ?? null, period: event.period ?? null }
+              : prev
+          );
         }
         break;
       case TIMETABLE_REALTIME_EVENTS.DRAG_ENDED:
         if (event.staffId !== staff.staffId) setRemoteDrag(null);
         break;
+      case TIMETABLE_REALTIME_EVENTS.EDIT_STARTED: {
+        // The lobby creator opened the dedicated edit workspace: every joined
+        // HOD navigates there too. Dedup repeated deliveries and never navigate
+        // when we are already on the edit route.
+        if (event.generationId && event.generationId !== generationId) break;
+        if (lastEditStartRef.current === generationId) break;
+        lastEditStartRef.current = generationId;
+        if (typeof window !== 'undefined' && window.location.pathname === '/lecturer/timetable-edit') break;
+        router.push(`/lecturer/timetable-edit?generationId=${encodeURIComponent(generationId)}`);
+        break;
+      }
       case TIMETABLE_REALTIME_EVENTS.LOBBY_CANCELLED:
         setLobby((prev) => (prev ? { ...prev, status: 'CANCELLED' } : prev));
         break;
       case TIMETABLE_REALTIME_EVENTS.TEACHING_GROUP_CREATED:
+      case TIMETABLE_REALTIME_EVENTS.TEACHING_GROUP_UPDATED:
       case TIMETABLE_REALTIME_EVENTS.TEACHING_GROUP_DELETED:
         if (showGroups) {
           getTeachingGroups(generation?.termId)
@@ -2232,6 +2866,20 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
     };
   }, [generationId]);
 
+  const [releasingLock, setReleasingLock] = useState(false);
+  const releaseLock = async () => {
+    if (releasingLock) return;
+    setReleasingLock(true);
+    try {
+      await releaseTimetableLock(generationId);
+      setLock((prev) => (prev ? { ...prev, locked: false, staffId: null, staffName: null, expiresAt: null } : prev));
+    } catch {
+      // the next lock poll will reconcile the real lock state
+    } finally {
+      setReleasingLock(false);
+    }
+  };
+
   const lastDragRef = useRef<{ day: number; period: number; at: number } | null>(null);
   const dragMoveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
@@ -2253,24 +2901,56 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
     }, DRAG_BROADCAST_MS);
   }, [generationId]);
 
-  const handleDragStart = (e: DragEvt<HTMLDivElement>, s: ScheduleResponse) => {
+  /** Resolve the schedule the user aimed at on a drop cell. Section-less
+   * special blocks (Assignment / LMS / exam) are the visible, pinned occupants
+   * and win over stacked course rows of the same table; in cell mode any
+   * covering session counts, in block mode only sessions starting on the cell. */
+  const resolveCellOccupant = (dragged: ScheduleResponse, day: number, period: number, mode: 'cell' | 'block'): ScheduleResponse | null => {
+    const source = schedules ?? [];
+    const at = (s: ScheduleResponse) =>
+      mode === 'cell'
+        ? period >= s.startPeriodNo && period <= s.endPeriodNo
+        : s.startPeriodNo === period;
+    const base = (s: ScheduleResponse) =>
+      s.dayOfWeek === day &&
+      at(s) &&
+      s.scheduleStatus !== 'CANCELLED' &&
+      s.scheduleId !== dragged.scheduleId;
+    const sameTable = (s: ScheduleResponse) =>
+      (dragged.semesterNo === null || s.semesterNo === null || s.semesterNo === dragged.semesterNo) &&
+      (dragged.sections.length === 0 || s.sections.length === 0 ||
+        s.sections.some((sn) => dragged.sections.includes(sn)));
+    const special = source.find((s) => base(s) && !s.courseCode);
+    if (special) return special;
+    return source.find((s) => base(s) && sameTable(s) && !!s.courseCode) ?? null;
+  };
+
+  const handleDragStart = (e: DragEvt<HTMLDivElement>, s: ScheduleResponse, anchorPeriod: number) => {
     if (!canEdit) {
       e.preventDefault();
       return;
     }
-    e.dataTransfer.setData('text/plain', s.scheduleId);
+    const rel = anchorPeriod - s.startPeriodNo;
+    const clampedStart = Math.max(1, s.startPeriodNo);
+    const clampedEnd = Math.min(MAX_PERIOD, s.endPeriodNo);
+    dragSpanRef.current = clampedEnd - clampedStart + 1;
+    e.dataTransfer.setData('text/plain', `${s.scheduleId}|${rel}`);
     e.dataTransfer.effectAllowed = 'move';
-    setRemoteDrag({ scheduleId: s.scheduleId, staffName: staff.staffName, day: s.dayOfWeek, period: s.startPeriodNo });
-    publishDragStatus(generationId, { action: 'start', scheduleId: s.scheduleId, day: s.dayOfWeek, period: s.startPeriodNo }).catch(() => {});
+    setRemoteDrag({ scheduleId: s.scheduleId, staffName: staff.staffName, day: s.dayOfWeek, period: anchorPeriod });
+    publishDragStatus(generationId, { action: 'start', scheduleId: s.scheduleId, day: s.dayOfWeek, period: anchorPeriod }).catch(() => {});
   };
 
   const handleDragOver = (e: DragEvt<HTMLDivElement>, day: number, period: number) => {
     if (!canEdit) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
+    const span = dragMode === 'single' ? 1 : dragSpanRef.current;
+    const fits = period >= 1 && period + span - 1 <= MAX_PERIOD;
     const cur = dragTarget;
-    if (cur && cur.day === day && cur.period === period) return;
-    setDragTarget({ day, period });
+    const next = fits ? { day, period, span } : null;
+    if (cur && next && cur.day === next.day && cur.period === next.period && cur.span === next.span) return;
+    if (!cur && !next) return;
+    setDragTarget(next);
     sendDragMove(day, period);
   };
 
@@ -2279,32 +2959,43 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
       if (!canEdit || saving) return;
       const dragged = (schedules ?? []).find((s) => s.scheduleId === scheduleId);
       if (!dragged) return;
-      const occupant = (schedules ?? []).find(
-        (s) =>
-          s.dayOfWeek === day &&
-          s.startPeriodNo === period &&
-          s.scheduleStatus !== 'CANCELLED' &&
-          s.scheduleId !== scheduleId
-      );
+      // The occupant is the visible pinned special block or the same-table
+      // course on the drop cell. A special block or a one-cell course always
+      // swaps as a single cell (its whole span is exactly that cell); larger
+      // courses swap as a block pinned to the same partner shown here.
+      const occupant = resolveCellOccupant(dragged, day, period, 'block');
       if (occupant) {
+        const singleCell = dragged.startPeriodNo === dragged.endPeriodNo;
+        const specialOccupant = !occupant.courseCode;
+        setSaveError(null);
         setPendingSwap({
           scheduleId,
           withScheduleId: occupant.scheduleId,
+          targetScheduleId: occupant.scheduleId,
+          sourceDay: dragged.dayOfWeek,
+          sourcePeriod: singleCell ? dragged.startPeriodNo : period,
           targetDay: day,
           targetPeriod: period,
           conflicts: null,
+          cell: specialOccupant || singleCell,
         });
         return;
       }
       setSaving(true);
       setSaveError(null);
+      const fromDay = dragged.dayOfWeek;
+      const fromPeriod = dragged.startPeriodNo;
       try {
         const res = await swapSchedules(generationId, { scheduleId, targetDay: day, targetPeriod: period, force: false });
-        if (res.swapped) {
-          setSchedules((prev) => (res.schedules.length > 0 ? res.schedules : prev));
+        // The backend's plain-move path returns swapped:false but still carries
+        // the moved schedule in res.schedules — treat that as success too.
+        if (res.swapped || (res.schedules?.length ?? 0) > 0) {
+          setSchedules((prev) => mergeScheduleUpdates(prev, res.schedules));
+          setUndoStack((prev) => [...prev, { kind: 'move', scheduleId, fromDay, fromPeriod, toDay: day, toPeriod: period }]);
+          setRedoStack([]);
           toast.success('Schedule moved');
-        } else if (res.conflicts.length > 0) {
-          setSaveError(`Move blocked — ${res.conflicts.join('; ')}`);
+        } else if ((res.conflicts?.length ?? 0) > 0) {
+          setSaveError(`Move blocked — ${(res.conflicts ?? []).join('; ')}`);
         } else {
           toast.error('Could not move schedule');
         }
@@ -2320,12 +3011,80 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
   const handleDrop = async (e: DragEvt<HTMLDivElement>, day: number, period: number) => {
     if (!canEdit) return;
     e.preventDefault();
-    const scheduleId = e.dataTransfer.getData('text/plain');
+    const raw = e.dataTransfer.getData('text/plain');
+    const [scheduleId, relPart] = raw.split('|');
+    const rel = Number(relPart || '0') || 0;
     setDragTarget(null);
     publishDragStatus(generationId, { action: 'end', scheduleId, day: null, period: null }).catch(() => {});
     setRemoteDrag(null);
     if (!scheduleId) return;
-    await moveScheduleTo(scheduleId, day, period);
+    const dragged = (schedules ?? []).find((s) => s.scheduleId === scheduleId);
+    if (!dragged) return;
+    const span = Math.min(MAX_PERIOD, dragged.endPeriodNo) - Math.max(1, dragged.startPeriodNo) + 1;
+    const grabbedPeriod = dragged.startPeriodNo + rel;
+
+    // Resolve the occupant before the mode branch so the exact cell content
+    // (the pinned special block, or the same-table course) is honoured in both
+    // modes. A section-less special block or a one-cell course always swaps as a
+    // single cell — its whole span IS the grabbed cell — even in the default
+    // (block) drag mode.
+    const occupant = resolveCellOccupant(dragged, day, period, dragMode === 'single' ? 'cell' : 'block');
+    if (occupant) {
+      const singleCellCourse = dragged.startPeriodNo === dragged.endPeriodNo;
+      const specialOccupant = !occupant.courseCode;
+      setSaveError(null);
+      if (dragMode === 'single' || specialOccupant || singleCellCourse) {
+        // Single-cell exchange: exactly the grabbed period swaps with the drop
+        // cell. For multi-period sources this drops the P1-P2 style rule — the
+        // grabbed half (start + rel) swaps alone, the rest re-anchors beside it.
+        setPendingSwap({
+          scheduleId,
+          withScheduleId: occupant.scheduleId,
+          targetScheduleId: occupant.scheduleId,
+          sourceDay: dragged.dayOfWeek,
+          sourcePeriod: grabbedPeriod,
+          targetDay: day,
+          targetPeriod: period,
+          conflicts: null,
+          cell: true,
+        });
+      } else {
+        // Whole-block exchange between two multi-period courses, pinned to the
+        // exact partner shown in the modal.
+        setPendingSwap({
+          scheduleId,
+          withScheduleId: occupant.scheduleId,
+          targetScheduleId: occupant.scheduleId,
+          sourceDay: dragged.dayOfWeek,
+          sourcePeriod: grabbedPeriod,
+          targetDay: day,
+          targetPeriod: period,
+          conflicts: null,
+          cell: false,
+        });
+      }
+      return;
+    }
+
+    // Empty cell: consecutive mode lands the whole block on the drop cell.
+    if (dragMode === 'consecutive') {
+      const blockStart = period;
+      if (blockStart < 1 || blockStart + span - 1 > MAX_PERIOD) {
+        setSaveError('That move would overflow the timetable');
+        return;
+      }
+      await moveScheduleTo(scheduleId, day, blockStart);
+      return;
+    }
+
+    // Empty cell in single mode: the grabbed cell lands on the drop cell and the
+    // rest of the session re-anchors beside it.
+    const newStart = period - rel;
+    if (newStart < 1 || newStart + span - 1 > MAX_PERIOD) {
+      setSaveError('That move would overflow the timetable');
+      return;
+    }
+    await moveScheduleTo(scheduleId, day, newStart);
   };
 
   const handleGridCellClick = (day: number, period: number) => {
@@ -2336,6 +3095,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
   };
 
   const handleSelectSchedule = (s: ScheduleResponse) => {
+    setLecturerDetail(null);
     setSelectedMeeting(s);
   };
 
@@ -2353,24 +3113,250 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
     if (!pendingSwap || saving) return;
     setSaving(true);
     setSaveError(null);
+    const source = (schedules ?? []).find((s) => s.scheduleId === pendingSwap.scheduleId);
+    const fromDay = source?.dayOfWeek ?? pendingSwap.targetDay;
+    const fromPeriod = source?.startPeriodNo ?? pendingSwap.targetPeriod;
+    const srcAssignment = source?.teachingAssignmentId ?? null;
+    const partner = (schedules ?? []).find((s) => s.scheduleId === pendingSwap.withScheduleId) ?? null;
+    const partnerAssignment = partner?.teachingAssignmentId ?? null;
+    const opSourceDay = pendingSwap.sourceDay ?? fromDay;
+    const opSourcePeriod = pendingSwap.sourcePeriod ?? fromPeriod;
     try {
-      const res = await swapSchedules(generationId, {
-        scheduleId: pendingSwap.scheduleId,
-        targetDay: pendingSwap.targetDay,
-        targetPeriod: pendingSwap.targetPeriod,
-        force,
-      });
-      if (res.swapped) {
-        setSchedules((prev) => (res.schedules.length > 0 ? res.schedules : prev));
-        setPendingSwap(null);
-        toast.success('Schedules swapped');
-      } else if (!force && res.conflicts.length > 0) {
+      const res = pendingSwap.cell
+        ? await swapCellSchedules(generationId, {
+            scheduleId: pendingSwap.scheduleId,
+            sourceDay: opSourceDay,
+            sourcePeriod: opSourcePeriod,
+            targetDay: pendingSwap.targetDay,
+            targetPeriod: pendingSwap.targetPeriod,
+            targetScheduleId: pendingSwap.targetScheduleId,
+            force,
+          })
+        : await swapSchedules(generationId, {
+            scheduleId: pendingSwap.scheduleId,
+            targetDay: pendingSwap.targetDay,
+            targetPeriod: pendingSwap.targetPeriod,
+            targetScheduleId: pendingSwap.withScheduleId,
+            force,
+          });
+      if (res.swapped || (res.schedules?.length ?? 0) > 0) {
+        if (pendingSwap.cell) {
+          // The backend replaces both original rows with decomposed parts, so a
+          // full refetch is the only consistent way to reflect it.
+          await refreshSchedules();
+          // Anchor the undo on the re-created live rows: the moved course's part
+          // sits on the drop cell, its partner on the grab cell.
+          const created = res.schedules ?? [];
+          const movedPart = created.find(
+            (c) =>
+              c.dayOfWeek === pendingSwap.targetDay &&
+              c.startPeriodNo <= pendingSwap.targetPeriod &&
+              c.endPeriodNo >= pendingSwap.targetPeriod &&
+              c.teachingAssignmentId === srcAssignment
+          );
+          const partnerPart = created.find(
+            (c) =>
+              c.dayOfWeek === opSourceDay &&
+              c.startPeriodNo <= opSourcePeriod &&
+              c.endPeriodNo >= opSourcePeriod &&
+              c.teachingAssignmentId === partnerAssignment
+          );
+          setPendingSwap(null);
+          setUndoStack((prev) => [
+            ...prev,
+            {
+              kind: 'cellSwap',
+              scheduleId: movedPart?.scheduleId ?? pendingSwap.scheduleId,
+              withScheduleId: partnerPart?.scheduleId ?? pendingSwap.withScheduleId,
+              srcAssignmentId: srcAssignment,
+              partnerAssignmentId: partnerAssignment,
+              fromDay: opSourceDay,
+              fromPeriod: opSourcePeriod,
+              toDay: pendingSwap.targetDay,
+              toPeriod: pendingSwap.targetPeriod,
+            },
+          ]);
+        } else {
+          setSchedules((prev) => mergeScheduleUpdates(prev, res.schedules));
+          setPendingSwap(null);
+          setUndoStack((prev) => [
+            ...prev,
+            { kind: 'move', scheduleId: pendingSwap.scheduleId, withScheduleId: pendingSwap.withScheduleId, fromDay, fromPeriod, toDay: pendingSwap.targetDay, toPeriod: pendingSwap.targetPeriod },
+          ]);
+        }
+        setRedoStack([]);
+        toast.success(`Swapped ${source?.courseCode ?? 'schedule'} and ${partner?.courseCode ?? 'schedule'}`);
+      } else if (!force && (res.conflicts?.length ?? 0) > 0) {
         setPendingSwap({ ...pendingSwap, conflicts: res.conflicts });
       } else {
-        toast.error('Could not swap schedules');
+        const msg = 'Could not swap schedules';
+        toast.error(msg);
+        setSaveError(msg);
+        setPendingSwap(null);
       }
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Could not swap schedules');
+      const msg = err instanceof Error ? err.message : 'Could not swap schedules';
+      toast.error(msg);
+      setSaveError(msg);
+      setPendingSwap(null);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDeleteSchedule = async (s: ScheduleResponse) => {
+    if (!canEdit || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await deleteSchedule(s.scheduleId);
+      setSchedules((prev) => (prev ? prev.filter((x) => x.scheduleId !== s.scheduleId) : prev));
+      setUndoStack((prev) => [...prev, { kind: 'delete', scheduleId: s.scheduleId, schedule: s }]);
+      setRedoStack([]);
+      if (selectedMeeting?.scheduleId === s.scheduleId) setSelectedMeeting(null);
+      if (moveTarget?.scheduleId === s.scheduleId) setMoveTarget(null);
+      toast.success('Schedule removed');
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not remove schedule');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const performUndo = async () => {
+    if (undoStack.length === 0 || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    let op = undoStack[undoStack.length - 1];
+    try {
+      if (op.kind === 'move') {
+        const res = await swapSchedules(generationId, {
+          scheduleId: op.scheduleId,
+          targetDay: op.fromDay ?? 1,
+          targetPeriod: op.fromPeriod ?? 1,
+          targetScheduleId: op.withScheduleId,
+          force: true,
+        });
+        if ((res.schedules?.length ?? 0) > 0) setSchedules((prev) => mergeScheduleUpdates(prev, res.schedules));
+      } else if (op.kind === 'cellSwap') {
+        // A cell swap is an involution: exchanging the same two cells again is
+        // the inverse operation. Re-create the rows, then re-anchor the redo on
+        // the fresh ids so it stays exact.
+        const res = await swapCellSchedules(generationId, {
+          scheduleId: op.scheduleId,
+          sourceDay: op.toDay ?? 1,
+          sourcePeriod: op.toPeriod ?? 1,
+          targetDay: op.fromDay ?? 1,
+          targetPeriod: op.fromPeriod ?? 1,
+          targetScheduleId: op.withScheduleId,
+          force: true,
+        });
+        if (res.swapped || (res.schedules?.length ?? 0) > 0) {
+          await refreshSchedules();
+          const created = res.schedules ?? [];
+          const backCourse = created.find(
+            (c) =>
+              c.dayOfWeek === (op.fromDay ?? 1) &&
+              c.startPeriodNo <= (op.fromPeriod ?? 1) &&
+              c.endPeriodNo >= (op.fromPeriod ?? 1) &&
+              c.teachingAssignmentId === op.srcAssignmentId
+          );
+          const backPartner = created.find(
+            (c) =>
+              c.dayOfWeek === (op.toDay ?? 1) &&
+              c.startPeriodNo <= (op.toPeriod ?? 1) &&
+              c.endPeriodNo >= (op.toPeriod ?? 1) &&
+              c.teachingAssignmentId === op.partnerAssignmentId
+          );
+          op = {
+            ...op,
+            scheduleId: backCourse?.scheduleId ?? op.scheduleId,
+            withScheduleId: backPartner?.scheduleId ?? op.withScheduleId,
+          };
+        }
+      } else if (op.schedule) {
+        const created = await createSchedule({
+          generationId: op.schedule.generationId,
+          teachingAssignmentId: op.schedule.teachingAssignmentId,
+          teachingGroupId: op.schedule.teachingGroupId,
+          dayOfWeek: op.schedule.dayOfWeek,
+          startSlotId: op.schedule.startSlotId,
+          endSlotId: op.schedule.endSlotId,
+          scheduleType: op.schedule.scheduleType,
+          scheduleStatus: op.schedule.scheduleStatus,
+          meetingType: op.schedule.meetingType,
+        });
+        op = { ...op, scheduleId: created.scheduleId };
+        setSchedules((prev) => (prev ? [...prev, created] : prev));
+      }
+      setUndoStack((prev) => prev.slice(0, -1));
+      setRedoStack((prev) => [...prev, op]);
+      toast.success(op.kind === 'move' ? 'Move undone' : op.kind === 'cellSwap' ? 'Cell swap undone' : 'Schedule restored');
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not undo');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const performRedo = async () => {
+    if (redoStack.length === 0 || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    let op = redoStack[redoStack.length - 1];
+    try {
+      if (op.kind === 'move') {
+        const res = await swapSchedules(generationId, {
+          scheduleId: op.scheduleId,
+          targetDay: op.toDay ?? 1,
+          targetPeriod: op.toPeriod ?? 1,
+          targetScheduleId: op.withScheduleId,
+          force: true,
+        });
+        if ((res.schedules?.length ?? 0) > 0) setSchedules((prev) => mergeScheduleUpdates(prev, res.schedules));
+      } else if (op.kind === 'cellSwap') {
+        const res = await swapCellSchedules(generationId, {
+          scheduleId: op.scheduleId,
+          sourceDay: op.fromDay ?? 1,
+          sourcePeriod: op.fromPeriod ?? 1,
+          targetDay: op.toDay ?? 1,
+          targetPeriod: op.toPeriod ?? 1,
+          targetScheduleId: op.withScheduleId,
+          force: true,
+        });
+        if (res.swapped || (res.schedules?.length ?? 0) > 0) {
+          await refreshSchedules();
+          // Re-anchor the undo op on the fresh live rows for the next undo.
+          const created = res.schedules ?? [];
+          const fwdCourse = created.find(
+            (c) =>
+              c.dayOfWeek === (op.toDay ?? 1) &&
+              c.startPeriodNo <= (op.toPeriod ?? 1) &&
+              c.endPeriodNo >= (op.toPeriod ?? 1) &&
+              c.teachingAssignmentId === op.srcAssignmentId
+          );
+          const fwdPartner = created.find(
+            (c) =>
+              c.dayOfWeek === (op.fromDay ?? 1) &&
+              c.startPeriodNo <= (op.fromPeriod ?? 1) &&
+              c.endPeriodNo >= (op.fromPeriod ?? 1) &&
+              c.teachingAssignmentId === op.partnerAssignmentId
+          );
+          op = {
+            ...op,
+            scheduleId: fwdCourse?.scheduleId ?? op.scheduleId,
+            withScheduleId: fwdPartner?.scheduleId ?? op.withScheduleId,
+          };
+        }
+      } else {
+        await deleteSchedule(op.scheduleId);
+        setSchedules((prev) => (prev ? prev.filter((x) => x.scheduleId !== op.scheduleId) : prev));
+      }
+      setRedoStack((prev) => prev.slice(0, -1));
+      setUndoStack((prev) => [...prev, op]);
+      toast.success(op.kind === 'move' ? 'Move redone' : op.kind === 'cellSwap' ? 'Cell swap redone' : 'Schedule removed again');
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not redo');
     } finally {
       setSaving(false);
     }
@@ -2526,6 +3512,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
   };
 
   const openGroups = async () => {
+    setShowCmr(false);
     setShowGroups(true);
     try {
       if (generation) {
@@ -2588,6 +3575,96 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
     });
   };
 
+  // The combined classes belonging to the current HOD's own department. Members
+  // already carry unitId/unitName (enriched server-side), so ownership is read
+  // from server-supplied data, never from browser-supplied ids.
+  const ownGroups = useMemo(
+    () => (groups ?? []).filter((g) => g.members.some((m) => m.unitId === staff.unitId)),
+    [groups, staff.unitId]
+  );
+
+  // Combined classes from OTHER departments (read-only for this HOD) plus the
+  // HOD's own, so cross-unit coordination stays visible. Group ownership uses
+  // the first member's unit; every member of a group shares the group's course
+  // unit, so this is unambiguous.
+  const allGroups = useMemo(
+    () => groups ?? [],
+    [groups]
+  );
+
+  // Distinct departments across every combined class (derived from the group's
+  // first member — all members of a group share the group's course unit).
+  const allGroupUnits = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const g of groups ?? []) {
+      const m = g.members[0];
+      if (m && m.unitId && !map.has(m.unitId)) map.set(m.unitId, m.unitName);
+    }
+    return [...map.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  }, [groups]);
+
+  // Semester options for the combined-class filter: prefer the generation
+  // scope's semesters, otherwise derive distinct semester numbers from groups.
+  const groupSemesters = useMemo(() => {
+    const source = scope ?? [];
+    const nums = source.length > 0
+      ? source.map((sc) => sc.semesterNo)
+      : (groups ?? []).map((g) => g.semesterNo);
+    return [...new Set(nums)].sort((a, b) => a - b);
+  }, [scope, groups]);
+
+  const scopeGroupFilter = (g: TeachingGroupResponse) =>
+    !scope || scope.some((sc) => sc.semesterNo === g.semesterNo);
+
+  const groupsUnitCount = allGroups.filter(
+    (g) =>
+      (!scope || scope.some((sc) => sc.semesterNo === g.semesterNo)) &&
+      (groupsSemFilter === 'all' || g.semesterNo === Number(groupsSemFilter))
+  ).length;
+
+  const groupsSemCount = allGroups.filter(
+    (g) =>
+      (!scope || scope.some((sc) => sc.semesterNo === g.semesterNo)) &&
+      (groupsUnitFilter === 'all' || (g.members[0]?.unitId ?? '') === groupsUnitFilter)
+  ).length;
+
+  // Free (unclaimed) assignments in the selected group's course+term that belong
+  // to this HOD's own unit and are not yet part of any combined class. These are
+  // the candidates for "Add Course".
+  const addableAssignments = useMemo(() => {
+    if (!addToGroupId) return [];
+    const group = (groups ?? []).find((g) => g.groupId === addToGroupId);
+    if (!group) return [];
+    const taken = (groups ?? []).flatMap((g) => g.members.map((m) => m.assignmentId));
+    return (assignments ?? []).filter(
+      (a) =>
+        a.termId === generation?.termId &&
+        a.courseId === group.courseId &&
+        a.unitId === staff.unitId &&
+        !taken.includes(a.assignmentId)
+    );
+  }, [addToGroupId, groups, assignments, generation?.termId, staff.unitId]);
+
+  const handleAddMembers = async () => {
+    if (!generation || !addToGroupId || addGroupsSaving) return;
+    if (addGroupAssignments.size === 0) {
+      toast.error('Select at least one section to add');
+      return;
+    }
+    setAddGroupsSaving(true);
+    try {
+      await addTeachingGroupMembers(addToGroupId, Array.from(addGroupAssignments));
+      toast.success('Sections added to combined class');
+      setAddGroupAssignments(new Set());
+      setAddToGroupId('');
+      setGroups(await getTeachingGroups(generation.termId));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not add sections to combined class');
+    } finally {
+      setAddGroupsSaving(false);
+    }
+  };
+
   const selectedTotal = useMemo(() => {
     let total = 0;
     selectedSemesters.forEach((sid) => {
@@ -2599,21 +3676,26 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
   const isPublished = status === 'PUBLISHED';
 
   const semesterOptions = useMemo(
-    () => [...new Set((schedules ?? []).map((s) => s.semesterNo))].sort((a, b) => a - b),
+    () =>
+      [...new Set((schedules ?? []).map((s) => s.semesterNo).filter((n): n is number => n != null))].sort(
+        (a, b) => a - b
+      ),
     [schedules]
   );
   const sectionOptions = useMemo(
     () => [...new Set((schedules ?? []).flatMap((s) => s.sections ?? []))].sort(),
     [schedules]
   );
-  const activeViewSemester = viewSemester;
-  const activeViewSection = viewSection !== 'all' && sectionOptions.includes(viewSection) ? viewSection : 'all';
+  const activeViewSemester = sectionScope ? sectionScope.semesterNo : viewSemester;
+  const activeViewSection = sectionScope ? sectionScope.section : viewSection !== 'all' && sectionOptions.includes(viewSection) ? viewSection : 'all';
   const visibleSchedules = useMemo(
     () =>
       (schedules ?? []).filter(
         (s) =>
-          (activeViewSemester === 'all' || s.semesterNo === activeViewSemester) &&
-          (activeViewSection === 'all' || (s.sections ?? []).includes(activeViewSection))
+          s.scheduleStatus !== 'CANCELLED' &&
+          (s.scheduleType !== 'COURSE' ||
+            ((activeViewSemester === 'all' || s.semesterNo === activeViewSemester) &&
+              (activeViewSection === 'all' || (s.sections ?? []).includes(activeViewSection))))
       ),
     [schedules, activeViewSemester, activeViewSection]
   );
@@ -2621,9 +3703,18 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
 
   if (loading) {
     return (
-      <div className="flex flex-col items-center justify-center py-24 gap-3">
-        <Loader2 size={22} className="animate-spin" style={{ color: 'var(--primary)' }} />
-        <div style={{ fontSize: 13, color: 'var(--text-lighter)' }}>Loading timetable workspace...</div>
+      <div style={{ maxWidth: 1080, margin: '0 auto', padding: '6px 0' }}>
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+          <div>
+            <div className="skeleton h-5 w-64" style={{ marginBottom: 8 }} />
+            <div className="skeleton h-3.5 w-40" />
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="skeleton h-8 w-32" />
+            <div className="skeleton h-8 w-32" />
+          </div>
+        </div>
+        <WeeklyGridSkeleton />
       </div>
     );
   }
@@ -2675,7 +3766,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
           )}
           {isHod && (
             <button
-              onClick={() => setShowCmr(true)}
+              onClick={() => { setShowGroups(false); setShowCmr(true); }}
               className="btn btn-ghost btn-sm gap-1.5 cursor-pointer"
               style={{ color: 'var(--primary)', border: '1.5px solid var(--surface-border)' }}
             >
@@ -2762,9 +3853,18 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
           style={{ borderRadius: 'var(--radius-md)', background: 'rgba(40,114,161,0.08)', border: '1.5px solid rgba(40,114,161,0.3)' }}
         >
           <Unlock size={14} style={{ color: 'var(--primary)' }} />
-          <div style={{ fontSize: 12.5, color: 'var(--primary)', fontWeight: 600 }}>
+          <div style={{ fontSize: 12.5, color: 'var(--primary)', fontWeight: 600, flex: '1 1 auto' }}>
             You hold the editing lock — drag schedules to rearrange the draft.
           </div>
+          <button
+            type="button"
+            disabled={releasingLock}
+            onClick={releaseLock}
+            className="btn btn-xs btn-outline"
+            style={{ flex: '0 0 auto', fontWeight: 600 }}
+          >
+            {releasingLock ? 'Releasing...' : 'Release Lock'}
+          </button>
         </div>
       )}
 
@@ -2775,7 +3875,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
         >
           <Radio size={14} className="animate-pulse" style={{ color: '#8b5cf6' }} />
           <div style={{ fontSize: 12.5, color: '#7c3aed', fontWeight: 600 }}>
-            {remoteDrag.staffName} is dragging a schedule
+            {remoteDrag.staffName} is dragging {remoteDrag.schedule ? <b>{remoteDrag.schedule.courseCode}</b> : 'a schedule'}
             {remoteDrag.day && remoteDrag.period ? ` to ${DAY_NAMES[remoteDrag.day - 1] ?? ''} P${remoteDrag.period}` : '...'}
           </div>
         </div>
@@ -2829,8 +3929,8 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
       </div>
 
       {workspaceTab === 'grid' ? (
-        <div className="grid grid-cols-1 xl:grid-cols-[290px_1fr] gap-[18px]">
-          {isHod && (
+        <div className={`grid gap-[18px] ${isHod && !sectionScope ? 'grid-cols-1 xl:grid-cols-[290px_1fr]' : 'grid-cols-1'}`}>
+          {isHod && !sectionScope && (
             <div className="bg-base-100 backdrop-blur-xl self-start" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-sm)', overflow: 'hidden' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 18px', borderBottom: '1px solid var(--surface)' }}>
                 <Layers size={15} style={{ color: 'var(--primary)' }} />
@@ -2927,16 +4027,34 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
 
                 <button
                   onClick={handleGenerate}
-                  disabled={!canEdit || saving || status === 'GENERATING'}
+                  disabled={!canEdit || saving || status === 'GENERATING' || snapshotStatus !== 'SNAPSHOT_READY'}
                   className="w-full btn btn-sm gap-1.5 border-none text-white cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{ background: 'linear-gradient(var(--primary), var(--primary-dark))', marginTop: 6 }}
                 >
-                  {saving ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+                  {saving || snapshotStatus === 'SNAPSHOT_PREPARING' ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
                   {status === 'COMPLETED' ? 'Regenerate' : 'Generate Timetable'}
                 </button>
                 <div className="text-center mt-2" style={{ fontSize: 11, color: 'var(--text-lighter)' }}>
-                  {selectedSemesters.size} semester{selectedSemesters.size === 1 ? '' : 's'} · {selectedTotal} section{selectedTotal === 1 ? '' : 's'}
+                  {snapshotStatus === 'SNAPSHOT_PREPARING' && 'Preparing timetable data…'}
+                  {snapshotStatus === 'SNAPSHOT_INVALID' && 'Preparing timetable data…'}
+                  {snapshotStatus === 'SNAPSHOT_ERROR' && (
+                    <span style={{ color: 'var(--danger, #e11d48)' }}>
+                      {snapshotError || 'Could not prepare timetable data'}
+                    </span>
+                  )}
+                  {snapshotStatus === 'SNAPSHOT_READY' &&
+                    `${selectedSemesters.size} semester${selectedSemesters.size === 1 ? '' : 's'} · ${selectedTotal} section${selectedTotal === 1 ? '' : 's'}`}
                 </div>
+                {snapshotStatus === 'SNAPSHOT_ERROR' && (
+                  <button
+                    onClick={retrySnapshot}
+                    disabled={snapshotPreparing}
+                    className="w-full btn btn-sm btn-outline gap-1.5 mt-2 cursor-pointer disabled:opacity-50"
+                  >
+                    {snapshotPreparing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                    Try again
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -2950,7 +4068,124 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
                 </span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                {semesterOptions.length > 1 && (
+                {sectionScope && (
+                  <span
+                    style={{
+                      fontSize: 10.5,
+                      fontWeight: 700,
+                      padding: '3px 9px',
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'rgba(40,114,161,0.12)',
+                      color: 'var(--primary)',
+                      border: '1.5px solid rgba(40,114,161,0.35)',
+                    }}
+                    title="This workspace is locked to this generated section. Use Back to return to the full timetable."
+                  >
+                    <CalendarCog size={10} className="inline mr-1" /> Editing Semester {sectionScope.semesterNo} — {sectionScope.section === 'all' ? 'All sections' : `Section ${sectionScope.section}`}
+                  </span>
+                )}
+                {canEdit && (
+                  <div
+                    className="flex items-center"
+                    style={{
+                      gap: 2,
+                      padding: 3,
+                      borderRadius: 'var(--radius-sm)',
+                      border: '1.5px solid var(--surface-border)',
+                      background: 'var(--divider)',
+                    }}
+                    title="Undo and redo the latest schedule moves and removes in this draft."
+                  >
+                    <button
+                      onClick={performUndo}
+                      disabled={undoStack.length === 0 || saving}
+                      className="cursor-pointer"
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 5,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        padding: '3px 9px',
+                        borderRadius: 5,
+                        border: 'none',
+                        color: 'var(--text-light)',
+                        background: 'transparent',
+                        opacity: undoStack.length === 0 || saving ? 0.4 : 1,
+                      }}
+                    >
+                      <Undo2 size={12} /> Undo
+                    </button>
+                    <button
+                      onClick={performRedo}
+                      disabled={redoStack.length === 0 || saving}
+                      className="cursor-pointer"
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 5,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        padding: '3px 9px',
+                        borderRadius: 5,
+                        border: 'none',
+                        color: 'var(--text-light)',
+                        background: 'transparent',
+                        opacity: redoStack.length === 0 || saving ? 0.4 : 1,
+                      }}
+                    >
+                      <Redo2 size={12} /> Redo
+                    </button>
+                  </div>
+                )}
+                {canEdit && (
+                  <div
+                    className="flex items-center"
+                    style={{
+                      gap: 2,
+                      padding: 3,
+                      borderRadius: 'var(--radius-sm)',
+                      border: '1.5px solid var(--surface-border)',
+                      background: 'var(--divider)',
+                    }}
+                    title="How a multi-period session is placed when dragged. Consecutive drags the whole block as its consecutive cells; Single cells splits a two-period session so P1 or P2 can each be grabbed and dropped on any single cell."
+                  >
+                    <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: '0.4px', textTransform: 'uppercase', color: 'var(--text-light)', padding: '2px 6px 2px 4px' }}>
+                      Drag
+                    </span>
+                    <button
+                      onClick={() => setDragMode('consecutive')}
+                      className="cursor-pointer"
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
+                        padding: '3px 9px',
+                        borderRadius: 5,
+                        border: 'none',
+                        color: dragMode === 'consecutive' ? '#fff' : 'var(--text-light)',
+                        background: dragMode === 'consecutive' ? 'linear-gradient(var(--primary), var(--primary-dark))' : 'transparent',
+                      }}
+                    >
+                      Consecutive
+                    </button>
+                    <button
+                      onClick={() => setDragMode('single')}
+                      className="cursor-pointer"
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
+                        padding: '3px 9px',
+                        borderRadius: 5,
+                        border: 'none',
+                        color: dragMode === 'single' ? '#fff' : 'var(--text-light)',
+                        background: dragMode === 'single' ? 'linear-gradient(var(--primary), var(--primary-dark))' : 'transparent',
+                      }}
+                    >
+                      Single cells
+                    </button>
+                  </div>
+                )}
+                {!sectionScope && semesterOptions.length > 1 && (
                   <select
                     value={String(activeViewSemester)}
                     onChange={(e) => setViewSemester(e.target.value === 'all' ? 'all' : Number(e.target.value))}
@@ -2973,7 +4208,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
                     ))}
                   </select>
                 )}
-                {sectionOptions.length > 1 && (
+                {!sectionScope && sectionOptions.length > 1 && (
                   <select
                     value={activeViewSection}
                     onChange={(e) => setViewSection(e.target.value)}
@@ -2996,7 +4231,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
                     ))}
                   </select>
                 )}
-                {activeViewSemester === 'all' && semesterOptions.length > 1 && (
+                {activeViewSemester === 'all' && semesterOptions.length > 1 && !sectionScope && (
                   <span
                     style={{
                       fontSize: 10.5,
@@ -3020,7 +4255,9 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
               </div>
             </div>
             <div style={{ padding: '16px 18px', overflowX: 'auto' }}>
-              {(schedules ?? []).length === 0 ? (
+              {status === 'GENERATING' ? (
+                <WeeklyGridSkeleton />
+              ) : (schedules ?? []).length === 0 ? (
                 <div className="text-center py-16">
                   <CalendarCog size={32} className="mx-auto mb-3 opacity-30" />
                   <p style={{ fontSize: 12.5, color: 'var(--text-lighter)', margin: 0 }}>
@@ -3031,10 +4268,12 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
                 <WeeklyTimetableGrid
                   schedules={visibleSchedules}
                   editable={canEdit}
+                  asSingleCohort={activeViewSection !== 'all'}
                   periodLabels={periodLabels}
                   lunchLabel={lunchLabel}
                   dragTarget={dragTarget}
                   remoteDrag={remoteDrag}
+                  dragMode={dragMode}
                   onDragOver={handleDragOver}
                   onDrop={handleDrop}
                   onDragStart={handleDragStart}
@@ -3075,69 +4314,173 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
         </div>
       )}
 
-      {selectedMeeting && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'var(--modal-bg)' }}>
-          <div className="bg-base-100 w-full max-w-md" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
-              <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 8 }}>
-                <CalendarCog size={15} style={{ color: 'var(--primary)' }} />
-                Meeting details
-              </div>
-              <button onClick={() => setSelectedMeeting(null)} className="btn btn-ghost btn-sm btn-circle cursor-pointer" style={{ color: 'var(--text-light)' }}>
-                <X size={15} />
-              </button>
-            </div>
-            <div style={{ padding: '16px 20px', display: 'grid', gap: 10 }}>
-              <div>
-                <div style={{ fontSize: 17, fontWeight: 800, color: 'var(--accent)', fontFamily: 'var(--font-mono, monospace)' }}>
-                  {selectedMeeting.courseCode}
+      {selectedMeeting && (() => {
+        const sm = selectedMeeting as ScheduleResponse;
+        const meetingStaff = sm.staffNames.length > 0 ? sm.staffNames : sm.staffName ? [sm.staffName] : [];
+        const meetingSections = sm.sections?.length ? sm.sections : sm.sectionName ? [sm.sectionName] : [];
+        const meetingGroup = sm.teachingGroupId
+          ? (groups ?? []).find((g) => g.groupId === sm.teachingGroupId) ?? null
+          : null;
+        const courseSchedules = (schedules ?? []).filter((s) => s.courseCode === sm.courseCode);
+        const isLecturerView = lecturerDetail !== null;
+        const lecturerSchedules = isLecturerView
+          ? (schedules ?? []).filter((s) => s.staffNames.includes(lecturerDetail as string) || s.staffName === lecturerDetail)
+          : [];
+
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={MODAL_BACKDROP}>
+            <div className="bg-base-100 w-full max-w-lg" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden', maxHeight: '92vh', display: 'flex', flexDirection: 'column' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--surface)', flexShrink: 0 }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {isLecturerView ? <Users size={15} style={{ color: 'var(--primary)' }} /> : <CalendarCog size={15} style={{ color: 'var(--primary)' }} />}
+                  {isLecturerView ? `Lecturer schedule — ${lecturerDetail}` : 'Course details'}
                 </div>
-                <div style={{ fontSize: 12.5, color: 'var(--text-light)' }}>{selectedMeeting.courseName}</div>
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '90px 1fr', gap: '6px 12px', fontSize: 12.5 }}>
-                <span style={{ color: 'var(--text-lighter)', fontWeight: 600 }}>Meeting</span>
-                <span style={{ color: 'var(--text)' }}>{meetingLabelOf(selectedMeeting)}</span>
-                <span style={{ color: 'var(--text-lighter)', fontWeight: 600 }}>Current</span>
-                <span style={{ color: 'var(--text)' }}>{slotTextOf(selectedMeeting)}</span>
-                <span style={{ color: 'var(--text-lighter)', fontWeight: 600 }}>Staff</span>
-                <span style={{ color: 'var(--text)', overflowWrap: 'anywhere' }}>
-                  {selectedMeeting.staffNames.length > 0 ? selectedMeeting.staffNames.join(', ') : selectedMeeting.staffName || '\u2014'}
-                </span>
-                <span style={{ color: 'var(--text-lighter)', fontWeight: 600 }}>Sections</span>
-                <span style={{ color: 'var(--text)' }}>
-                  {(selectedMeeting.sections?.length ? selectedMeeting.sections : selectedMeeting.sectionName ? [selectedMeeting.sectionName] : []).join(' + ') || '\u2014'}
-                </span>
-              </div>
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '14px 20px', borderTop: '1px solid var(--surface)' }}>
-              <button onClick={() => setSelectedMeeting(null)} className="btn btn-ghost btn-sm cursor-pointer" style={{ color: 'var(--text-light)' }}>
-                Close
-              </button>
-              {canEdit && (
-                <button
-                  onClick={() => {
-                    setMoveTarget(selectedMeeting);
-                    setSelectedMeeting(null);
-                  }}
-                  disabled={saving}
-                  className="btn btn-sm gap-1.5 border-none text-white cursor-pointer disabled:opacity-50"
-                  style={{ background: 'linear-gradient(var(--primary), var(--primary-dark))' }}
-                >
-                  <Move size={13} />
-                  {(((selectedMeeting.endPeriodNo - selectedMeeting.startPeriodNo) - selectedMeeting.startPeriodNo + 1) > 1) ? (
-                    'Move this 2-period meeting'
-                  ) : (
-                    'Move this meeting'
-                  )}
+                <button onClick={() => setSelectedMeeting(null)} className="btn btn-ghost btn-sm btn-circle cursor-pointer" style={{ color: 'var(--text-light)' }}>
+                  <X size={15} />
                 </button>
+              </div>
+
+              <div style={{ padding: '16px 20px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
+                {isLecturerView ? (
+                  <>
+                    <div style={{ marginBottom: 12, fontSize: 12.5, color: 'var(--text-light)' }}>
+                      {lecturerSchedules.length} session{lecturerSchedules.length === 1 ? '' : 's'} across the week for <b style={{ color: 'var(--text)' }}>{lecturerDetail}</b>.
+                    </div>
+                    <MiniTimetable schedules={lecturerSchedules} />
+                    <div style={{ marginTop: 12 }}>
+                      <button
+                        onClick={() => setLecturerDetail(null)}
+                        className="btn btn-sm btn-ghost gap-1.5 cursor-pointer"
+                        style={{ color: 'var(--primary)', fontWeight: 600 }}
+                      >
+                        <ArrowLeft size={13} /> Back to course details
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: 'var(--accent)', fontFamily: 'var(--font-mono, monospace)' }}>
+                        {sm.courseCode}
+                      </div>
+                      <div style={{ fontSize: 13.5, color: 'var(--text-light)' }}>{sm.courseName}</div>
+                    </div>
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '96px 1fr', gap: '8px 14px', fontSize: 13, marginTop: 14 }}>
+                      <span style={{ color: 'var(--text-lighter)', fontWeight: 600 }}>Session</span>
+                      <span style={{ color: 'var(--text)' }}>{meetingLabelOf(sm)}</span>
+                      <span style={{ color: 'var(--text-lighter)', fontWeight: 600 }}>Day / Period</span>
+                      <span style={{ color: 'var(--text)' }}>{slotTextOf(sm)}</span>
+                      <span style={{ color: 'var(--text-lighter)', fontWeight: 600 }}>Section</span>
+                      <span style={{ color: 'var(--text)' }}>{meetingSections.join(' + ') || '\u2014'}</span>
+                      <span style={{ color: 'var(--text-lighter)', fontWeight: 600 }}>Lecturer</span>
+                      <span style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {meetingStaff.length > 0 ? (
+                          meetingStaff.map((name) => (
+                            <button
+                              key={name}
+                              onClick={() => setLecturerDetail(name)}
+                              title={`Open ${name}'s weekly schedule`}
+                              className="btn btn-ghost btn-xs gap-1 cursor-pointer shrink-0"
+                              style={{ color: 'var(--primary)', border: '1.5px solid rgba(40,114,161,0.3)', fontWeight: 700 }}
+                            >
+                              <Users size={11} /> {name}
+                            </button>
+                          ))
+                        ) : (
+                          <span style={{ color: 'var(--text)' }}>—</span>
+                        )}
+                      </span>
+                    </div>
+
+                    {meetingGroup && (
+                      <div style={{ marginTop: 14, padding: '10px 12px', borderRadius: 'var(--radius-md)', border: '1.5px solid rgba(124,58,237,0.3)', background: 'rgba(139,92,246,0.08)' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 800, color: '#7c3aed', marginBottom: 6 }}>
+                          <Blocks size={13} /> Combined class
+                        </div>
+                        <div style={{ fontSize: 12.5, color: 'var(--text)' }}>
+                          {meetingGroup.groupName}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: 'var(--text-light)' }}>
+                          {meetingGroup.courseCode} · Semester {meetingGroup.semesterNo} · {meetingGroup.members.length} sections
+                        </div>
+                        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6 }}>
+                          {meetingGroup.members.map((m, i) => (
+                            <span
+                              key={m.assignmentId}
+                              className="badge badge-xs"
+                              style={{ background: `rgba(40,114,161,${0.08 + i * 0.03})`, color: 'var(--primary)', border: 'none', fontWeight: 600 }}
+                            >
+                              Sec {m.sectionName} · {m.staffName}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {courseSchedules.length > 0 && (
+                      <div style={{ marginTop: 18 }}>
+                        <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--accent)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <CalendarCog size={13} style={{ color: 'var(--primary)' }} /> Course weekly schedule
+                        </div>
+                        <MiniTimetable schedules={courseSchedules} />
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {!isLecturerView && (
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '14px 20px', borderTop: '1px solid var(--surface)', flexShrink: 0 }}>
+                  <button onClick={() => setSelectedMeeting(null)} className="btn btn-ghost btn-sm cursor-pointer" style={{ color: 'var(--text-light)' }}>
+                    Close
+                  </button>
+                  {canEdit && (
+                    <button
+                      onClick={() => {
+                        setMoveTarget(selectedMeeting);
+                        setSelectedMeeting(null);
+                      }}
+                      disabled={saving}
+                      className="btn btn-sm gap-1.5 border-none text-white cursor-pointer disabled:opacity-50"
+                      style={{ background: 'linear-gradient(var(--primary), var(--primary-dark))' }}
+                    >
+                      <Move size={13} />
+                      {(sm.endPeriodNo - sm.startPeriodNo + 1 > 1) ? (
+                        'Move this 2-period meeting'
+                      ) : (
+                        'Move this meeting'
+                      )}
+                    </button>
+                  )}
+                  {canEdit && (
+                    <button
+                      onClick={() =>
+                        setConfirmDialog({
+                          title: 'Remove schedule',
+                          message: `Remove "${sm.courseCode}" at ${slotTextOf(sm)} from this draft? The timetable cell is freed, and you can restore the meeting with Undo.`,
+                          confirmLabel: 'Remove',
+                          tone: 'danger',
+                          action: () => handleDeleteSchedule(sm),
+                        })
+                      }
+                      disabled={saving}
+                      className="btn btn-sm gap-1.5 cursor-pointer disabled:opacity-50"
+                      style={{ color: '#dc2626', border: '1.5px solid rgba(220,38,38,0.4)', background: 'rgba(220,38,38,0.08)', fontWeight: 700 }}
+                    >
+                      <Trash2 size={13} />
+                      Delete
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {electivePick && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'var(--modal-bg)' }}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={MODAL_BACKDROP}>
           <div className="bg-base-100 w-full max-w-md" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -3199,12 +4542,15 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
       )}
 
       {pendingSwap && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'var(--modal-bg)' }}>
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={MODAL_BACKDROP}
+        >
           <div className="bg-base-100 w-full max-w-md" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 8 }}>
                 <RefreshCw size={15} style={{ color: 'var(--primary)' }} />
-                Swap schedules?
+                {pendingSwap.cell ? 'Swap single cells?' : 'Swap schedules?'}
               </div>
               <button onClick={() => setPendingSwap(null)} className="btn btn-ghost btn-sm btn-circle cursor-pointer" style={{ color: 'var(--text-light)' }}>
                 <X size={15} />
@@ -3236,9 +4582,17 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
                 );
               })()}
               {!pendingSwap.conflicts ? (
-                <p style={{ fontSize: 13, color: 'var(--text-light)', margin: 0 }}>
-                  This cell is occupied by another schedule. Swapping exchanges the two schedules&apos; positions.
-                </p>
+                pendingSwap.cell ? (
+                  <p style={{ fontSize: 13, color: 'var(--text-light)', margin: 0 }}>
+                    This single period is occupied. Swapping exchanges just these two cells — each session
+                    stays contiguous wherever possible (e.g. dragging the P2 half of a P1-P2 session onto P3
+                    swaps P2 and P3 only).
+                  </p>
+                ) : (
+                  <p style={{ fontSize: 13, color: 'var(--text-light)', margin: 0 }}>
+                    This cell is occupied by another schedule. Swapping exchanges the two schedules&apos; positions.
+                  </p>
+                )
               ) : (
                 <div>
                   <div className="flex items-center gap-2 mb-3" style={{ color: 'var(--danger)', fontSize: 12.5, fontWeight: 700 }}>
@@ -3278,7 +4632,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
       )}
 
       {confirmDialog && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'var(--modal-bg)' }}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={MODAL_BACKDROP}>
           <div className="bg-base-100 w-full max-w-md" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }}>
             <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)' }}>{confirmDialog.title}</div>
@@ -3316,7 +4670,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
       )}
 
       {showInvite && activeLobby && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'var(--modal-bg)' }}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={MODAL_BACKDROP}>
           <div className="bg-base-100 w-full max-w-md" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -3364,7 +4718,10 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
       )}
 
       {showGroups && (
-        <div className="fixed inset-0 z-50 flex items-center justify-end" style={{ background: 'var(--modal-bg)' }}>
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-end"
+          style={{ background: 'rgba(9, 25, 35, 0.35)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)' }}
+        >
           <div className="h-full w-full max-w-[420px] bg-base-100 flex flex-col" style={{ borderLeft: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -3375,122 +4732,398 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
               </button>
             </div>
             <div className="flex-1 overflow-y-auto" style={{ padding: '16px 20px' }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 10 }}>Create combined class</div>
-              <div className="relative mb-3">
-                <select
-                  value={groupCourseId}
-                  onChange={(e) => {
-                    setGroupCourseId(e.target.value);
-                    setGroupAssignments(new Set());
-                  }}
-                  className="w-full appearance-none cursor-pointer"
-                  style={{
-                    fontSize: 13,
-                    padding: '8px 30px 8px 12px',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1.5px solid var(--surface-border)',
-                    background: 'var(--divider)',
-                    color: 'var(--text)',
-                    outline: 'none',
-                  }}
+              {/* My Unit vs All Units tabs (mirrors the CMR drawer pattern) */}
+              <div className="flex gap-1 mb-4 p-1" style={{ background: 'var(--divider)', borderRadius: 'var(--radius-md)' }}>
+                <button
+                  onClick={() => setGroupsTab('myUnit')}
+                  className="flex-1 btn btn-xs gap-1 cursor-pointer"
+                  style={groupsTab === 'myUnit'
+                    ? { background: 'var(--base-100)', color: 'var(--primary)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-sm)', fontWeight: 700 }
+                    : { background: 'transparent', color: 'var(--text-light)', border: '1px solid transparent' }}
                 >
-                  <option value="">Select course...</option>
-                  {(unitCourses ?? []).map((c) => (
-                    <option key={c.courseId} value={c.courseId}>{c.courseCode} — {c.courseName}</option>
-                  ))}
-                </select>
-                <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-lighter)' }} />
+                  {groupsTab === 'myUnit' && <Check size={11} style={{ color: 'var(--primary)' }} />}
+                  My Unit
+                </button>
+                <button
+                  onClick={() => setGroupsTab('allUnits')}
+                  className="flex-1 btn btn-xs gap-1 cursor-pointer"
+                  style={groupsTab === 'allUnits'
+                    ? { background: 'var(--base-100)', color: 'var(--primary)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-sm)', fontWeight: 700 }
+                    : { background: 'transparent', color: 'var(--text-light)', border: '1px solid transparent' }}
+                >
+                  {groupsTab === 'allUnits' && <Check size={11} style={{ color: 'var(--primary)' }} />}
+                  All Units
+                </button>
               </div>
-              {groupCourseId && (
-                <div className="mb-3">
-                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--accent)', marginBottom: 6 }}>
-                    Sections to combine ({groupAssignments.size} selected)
-                  </div>
-                  <div style={{ display: 'grid', gap: 6 }}>
-                    {groupCourseAssignments.length === 0 && (
-                      <div style={{ fontSize: 11.5, color: 'var(--text-lighter)' }}>No teaching assignments for this course this term</div>
-                    )}
-                    {groupCourseAssignments.map((a) => (
-                      <label key={a.assignmentId} className="flex items-center gap-2 cursor-pointer" style={{ fontSize: 12, color: 'var(--text)' }}>
-                        <input
-                          type="checkbox"
-                          checked={groupAssignments.has(a.assignmentId)}
-                          onChange={() => {
-                            setGroupAssignments((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(a.assignmentId)) next.delete(a.assignmentId);
-                              else next.add(a.assignmentId);
-                              return next;
-                            });
-                          }}
-                          style={{ accentColor: 'var(--primary)', cursor: 'pointer' }}
-                        />
-                        Section {a.sectionName} — {a.staffName}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-              )}
-              <button
-                onClick={handleCreateGroup}
-                disabled={groupsSaving}
-                className="w-full btn btn-sm gap-1.5 border-none text-white cursor-pointer disabled:opacity-50"
-                style={{ background: 'linear-gradient(var(--primary), var(--primary-dark))' }}
-              >
-                {groupsSaving ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
-                Create combined class
-              </button>
 
-              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', margin: '20px 0 10px' }}>Existing classes</div>
-              {!groups && (
-                <div className="text-center py-6 text-xs flex items-center justify-center gap-2" style={{ color: 'var(--text-lighter)' }}>
-                  <Loader2 size={14} className="animate-spin" /> Loading...
-                </div>
-              )}
-              {groups && groups.length === 0 && (
-                <div className="text-center py-6 text-xs" style={{ color: 'var(--text-lighter)' }}>No combined classes yet</div>
-              )}
-              {(groups ?? []).map((g) => (
-                <div key={g.groupId} className="px-3 py-3 mb-2" style={{ borderRadius: 'var(--radius-md)', border: '1.5px solid var(--surface-border)', background: 'var(--divider)' }}>
-                  <div className="flex items-center justify-between gap-2 mb-1.5">
-                    <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)' }}>{g.groupName}</span>
-                    <button
-                      onClick={() => handleDeleteGroup(g)}
-                      className="btn btn-ghost btn-xs btn-circle cursor-pointer"
-                      style={{ color: 'var(--danger)' }}
-                      title="Delete combined class"
+              {groupsTab === 'myUnit' ? (
+                <>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 10 }}>Create combined class</div>
+                  <div className="relative mb-3">
+                    <select
+                      value={groupCourseId}
+                      onChange={(e) => {
+                        setGroupCourseId(e.target.value);
+                        setGroupAssignments(new Set());
+                      }}
+                      className="w-full appearance-none cursor-pointer"
+                      style={{
+                        fontSize: 13,
+                        padding: '8px 30px 8px 12px',
+                        borderRadius: 'var(--radius-md)',
+                        border: '1.5px solid var(--surface-border)',
+                        background: 'var(--divider)',
+                        color: 'var(--text)',
+                        outline: 'none',
+                      }}
                     >
-                      <Trash2 size={12} />
-                    </button>
+                      <option value="">Select course...</option>
+                      {(unitCourses ?? []).map((c) => (
+                        <option key={c.courseId} value={c.courseId}>{c.courseCode} — {c.courseName}</option>
+                      ))}
+                    </select>
+                    <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-lighter)' }} />
                   </div>
-                  <div style={{ fontSize: 11, color: 'var(--text-lighter)', marginBottom: 6 }}>
-                    {g.courseCode} · Semester {g.semesterNo} · {g.members.length} sections
+                  {groupCourseId && (
+                    <div className="mb-3">
+                      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--accent)', marginBottom: 6 }}>
+                        Sections to combine ({groupAssignments.size} selected)
+                      </div>
+                      <div style={{ display: 'grid', gap: 6 }}>
+                        {groupCourseAssignments.length === 0 && (
+                          <div style={{ fontSize: 11.5, color: 'var(--text-lighter)' }}>No teaching assignments for this course this term</div>
+                        )}
+                        {groupCourseAssignments.map((a) => (
+                          <label key={a.assignmentId} className="flex items-center gap-2 cursor-pointer" style={{ fontSize: 12, color: 'var(--text)' }}>
+                            <input
+                              type="checkbox"
+                              checked={groupAssignments.has(a.assignmentId)}
+                              onChange={() => {
+                                setGroupAssignments((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(a.assignmentId)) next.delete(a.assignmentId);
+                                  else next.add(a.assignmentId);
+                                  return next;
+                                });
+                              }}
+                              style={{ accentColor: 'var(--primary)', cursor: 'pointer' }}
+                            />
+                            Section {a.sectionName} — {a.staffName}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <button
+                    onClick={handleCreateGroup}
+                    disabled={groupsSaving}
+                    className="w-full btn btn-sm gap-1.5 border-none text-white cursor-pointer disabled:opacity-50"
+                    style={{ background: 'linear-gradient(var(--primary), var(--primary-dark))' }}
+                  >
+                    {groupsSaving ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
+                    Create combined class
+                  </button>
+
+                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', margin: '20px 0 10px' }}>My classes (this timetable)</div>
+                  {!groups && (
+                    <div className="text-center py-6 text-xs flex items-center justify-center gap-2" style={{ color: 'var(--text-lighter)' }}>
+                      <Loader2 size={14} className="animate-spin" /> Loading...
+                    </div>
+                  )}
+                  {groups && ownGroups.filter(scopeGroupFilter).length === 0 && (
+                    <div className="text-center py-6 text-xs" style={{ color: 'var(--text-lighter)' }}>
+                      {groups.length === 0 ? 'No combined classes yet' : 'No combined classes from your unit in this timetable\u2019s scope'}
+                    </div>
+                  )}
+                  {ownGroups.filter(scopeGroupFilter).map((g) => (
+                    <div key={g.groupId} className="px-3 py-3 mb-2" style={{ borderRadius: 'var(--radius-md)', border: '1.5px solid var(--surface-border)', background: 'var(--divider)' }}>
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)' }}>{g.groupName}</span>
+                        <button
+                          onClick={() => handleDeleteGroup(g)}
+                          className="btn btn-ghost btn-xs btn-circle cursor-pointer"
+                          style={{ color: 'var(--danger)' }}
+                          title="Delete combined class"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--text-lighter)', marginBottom: 6 }}>
+                        {g.courseCode} · Semester {g.semesterNo} · {g.members.length} sections
+                      </div>
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                        {g.members.map((m, i) => (
+                          <span
+                            key={m.assignmentId}
+                            className="badge badge-xs"
+                            style={{
+                              background: `rgba(40,114,161,${0.08 + i * 0.03})`,
+                              color: 'var(--primary)',
+                              border: 'none',
+                              fontWeight: 600,
+                            }}
+                          >
+                            Sec {m.sectionName} · {m.staffName}
+                          </span>
+                        ))}
+                      </div>
+                      <button
+                        onClick={() => {
+                          setAddToGroupId((prev) => (prev === g.groupId ? '' : g.groupId));
+                          setAddGroupAssignments(new Set());
+                        }}
+                        className="btn btn-ghost btn-xs gap-1 cursor-pointer mt-2"
+                        style={{ color: 'var(--primary)' }}
+                      >
+                        {addToGroupId === g.groupId ? <X size={11} /> : <Plus size={11} />}
+                        {addToGroupId === g.groupId ? 'Cancel' : 'Add Course'}
+                      </button>
+                      {addToGroupId === g.groupId && (
+                        <div className="mt-2 pt-2" style={{ borderTop: '1px dashed var(--surface-border)' }}>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--accent)', marginBottom: 6 }}>
+                            Add sections ({addGroupAssignments.size} selected)
+                          </div>
+                          {addableAssignments.length === 0 ? (
+                            <div style={{ fontSize: 11.5, color: 'var(--text-lighter)' }}>
+                              No free sections for {g.courseCode} this term
+                            </div>
+                          ) : (
+                            <>
+                              <div style={{ display: 'grid', gap: 6, marginBottom: 8 }}>
+                                {addableAssignments.map((a) => (
+                                  <label key={a.assignmentId} className="flex items-center gap-2 cursor-pointer" style={{ fontSize: 12, color: 'var(--text)' }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={addGroupAssignments.has(a.assignmentId)}
+                                      onChange={() => {
+                                        setAddGroupAssignments((prev) => {
+                                          const next = new Set(prev);
+                                          if (next.has(a.assignmentId)) next.delete(a.assignmentId);
+                                          else next.add(a.assignmentId);
+                                          return next;
+                                        });
+                                      }}
+                                      style={{ accentColor: 'var(--primary)', cursor: 'pointer' }}
+                                    />
+                                    Section {a.sectionName} — {a.staffName}
+                                  </label>
+                                ))}
+                              </div>
+                              <button
+                                onClick={handleAddMembers}
+                                disabled={addGroupsSaving || addGroupAssignments.size === 0}
+                                className="w-full btn btn-xs gap-1.5 border-none text-white cursor-pointer disabled:opacity-50"
+                                style={{ background: 'linear-gradient(var(--primary), var(--primary-dark))' }}
+                              >
+                                {addGroupsSaving ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                                Add to combined class
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10.5, fontWeight: 600, color: 'var(--text-lighter)', marginBottom: 12 }}>
+                    <Eye size={12} style={{ color: 'var(--text-lighter)' }} />
+                    <span>Other units are view only — cross-unit read access. Your own classes remain editable.</span>
                   </div>
-                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                    {g.members.map((m, i) => (
-                      <span
-                        key={m.assignmentId}
-                        className="badge badge-xs"
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                    <div className="relative flex-1">
+                      <select
+                        value={groupsUnitFilter}
+                        onChange={(e) => setGroupsUnitFilter(e.target.value)}
+                        className="w-full appearance-none cursor-pointer"
                         style={{
-                          background: `rgba(40,114,161,${0.08 + i * 0.03})`,
-                          color: 'var(--primary)',
-                          border: 'none',
-                          fontWeight: 600,
+                          fontSize: 13,
+                          padding: '8px 30px 8px 12px',
+                          borderRadius: 'var(--radius-md)',
+                          border: '1.5px solid var(--surface-border)',
+                          background: 'var(--divider)',
+                          color: 'var(--text)',
+                          outline: 'none',
                         }}
                       >
-                        Sec {m.sectionName} · {m.staffName}
-                      </span>
-                    ))}
+                        <option value="all">All units ({groupsUnitCount})</option>
+                        {allGroupUnits.map(([unitId, unitName]) => (
+                          <option key={unitId} value={unitId}>{unitName}</option>
+                        ))}
+                      </select>
+                      <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-lighter)' }} />
+                    </div>
+                    <div className="relative flex-1">
+                      <select
+                        value={groupsSemFilter}
+                        onChange={(e) => setGroupsSemFilter(e.target.value)}
+                        className="w-full appearance-none cursor-pointer"
+                        style={{
+                          fontSize: 13,
+                          padding: '8px 30px 8px 12px',
+                          borderRadius: 'var(--radius-md)',
+                          border: '1.5px solid var(--surface-border)',
+                          background: 'var(--divider)',
+                          color: 'var(--text)',
+                          outline: 'none',
+                        }}
+                      >
+                        <option value="all">All semesters ({groupsSemCount})</option>
+                        {groupSemesters.map((no) => (
+                          <option key={no} value={String(no)}>Semester {no}</option>
+                        ))}
+                      </select>
+                      <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-lighter)' }} />
+                    </div>
                   </div>
-                </div>
-              ))}
+                  {!groups && (
+                    <div className="text-center py-6 text-xs flex items-center justify-center gap-2" style={{ color: 'var(--text-lighter)' }}>
+                      <Loader2 size={14} className="animate-spin" /> Loading...
+                    </div>
+                  )}
+                  {groups && allGroups.filter(scopeGroupFilter).length === 0 && (
+                    <div className="text-center py-6 text-xs" style={{ color: 'var(--text-lighter)' }}>
+                      {groups.length === 0 ? 'No combined classes yet' : 'No combined classes in this timetable\u2019s scope'}
+                    </div>
+                  )}
+                  {(() => {
+                    const unitSections = new Map<string, TeachingGroupResponse[]>();
+                    const unitNames = new Map<string, string>();
+                    for (const g of allGroups) {
+                      if (!scopeGroupFilter(g)) continue;
+                      if (groupsUnitFilter !== 'all' && g.members[0]?.unitId !== groupsUnitFilter) continue;
+                      if (groupsSemFilter !== 'all' && g.semesterNo !== Number(groupsSemFilter)) continue;
+                      const uid = g.members[0]?.unitId ?? '';
+                      const uname = g.members[0]?.unitName ?? 'Unknown unit';
+                      if (!unitSections.has(uid)) {
+                        unitSections.set(uid, []);
+                        unitNames.set(uid, uname);
+                      }
+                      unitSections.get(uid)!.push(g);
+                    }
+                    if (unitSections.size === 0) {
+                      return (
+                        <div className="text-center py-6 text-xs" style={{ color: 'var(--text-lighter)' }}>
+                          No combined classes match this filter
+                        </div>
+                      );
+                    }
+                    return [...unitSections.entries()].map(([uid, list]) => (
+                      <Fragment key={uid}>
+                        <div className="flex items-center gap-1.5 mb-2" style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.4px', color: 'var(--text-light)' }}>
+                          {unitNames.get(uid) ?? 'Unit'}
+                          <span style={{ color: 'var(--text-lighter)', fontWeight: 600, letterSpacing: 'normal' }}>({list.length})</span>
+                        </div>
+                        {list.map((g) => {
+                          const isOwn = ownGroups.some((og) => og.groupId === g.groupId);
+                          return (
+                      <div key={g.groupId} className="px-3 py-3 mb-2" style={{ borderRadius: 'var(--radius-md)', border: '1.5px solid var(--surface-border)', background: 'var(--divider)' }}>
+                        <div className="flex items-center justify-between gap-2 mb-1.5">
+                          <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)' }}>{g.groupName}</span>
+                          {isOwn && (
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                onClick={() => {
+                                  setAddToGroupId((prev) => (prev === g.groupId ? '' : g.groupId));
+                                  setAddGroupAssignments(new Set());
+                                }}
+                                className="btn btn-ghost btn-xs gap-1 cursor-pointer"
+                                style={{ color: 'var(--primary)' }}
+                              >
+                                {addToGroupId === g.groupId ? <X size={11} /> : <Plus size={11} />}
+                                {addToGroupId === g.groupId ? 'Cancel' : 'Add Course'}
+                              </button>
+                              <button
+                                onClick={() => handleDeleteGroup(g)}
+                                className="btn btn-ghost btn-xs btn-circle cursor-pointer"
+                                style={{ color: 'var(--danger)' }}
+                                title="Delete combined class"
+                              >
+                                <Trash2 size={12} />
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 11, color: 'var(--text-lighter)', marginBottom: 6 }}>
+                          {g.courseCode} · Semester {g.semesterNo} · {g.members.length} sections{isOwn ? '' : ' · View only'}
+                        </div>
+                        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                          {g.members.map((m, i) => (
+                            <span
+                              key={m.assignmentId}
+                              className="badge badge-xs"
+                              style={{
+                                background: `rgba(40,114,161,${0.08 + i * 0.03})`,
+                                color: 'var(--primary)',
+                                border: 'none',
+                                fontWeight: 600,
+                              }}
+                              title={m.unitName}
+                            >
+                              Sec {m.sectionName} · {m.staffName} · {m.unitName}
+                            </span>
+                          ))}
+                        </div>
+                        {isOwn && addToGroupId === g.groupId && (
+                          <div className="mt-2 pt-2" style={{ borderTop: '1px dashed var(--surface-border)' }}>
+                            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--accent)', marginBottom: 6 }}>
+                              Add sections ({addGroupAssignments.size} selected)
+                            </div>
+                            {addableAssignments.length === 0 ? (
+                              <div style={{ fontSize: 11.5, color: 'var(--text-lighter)' }}>
+                                No free sections for {g.courseCode} this term
+                              </div>
+                            ) : (
+                              <>
+                                <div style={{ display: 'grid', gap: 6, marginBottom: 8 }}>
+                                  {addableAssignments.map((a) => (
+                                    <label key={a.assignmentId} className="flex items-center gap-2 cursor-pointer" style={{ fontSize: 12, color: 'var(--text)' }}>
+                                      <input
+                                        type="checkbox"
+                                        checked={addGroupAssignments.has(a.assignmentId)}
+                                        onChange={() => {
+                                          setAddGroupAssignments((prev) => {
+                                            const next = new Set(prev);
+                                            if (next.has(a.assignmentId)) next.delete(a.assignmentId);
+                                            else next.add(a.assignmentId);
+                                            return next;
+                                          });
+                                        }}
+                                        style={{ accentColor: 'var(--primary)', cursor: 'pointer' }}
+                                      />
+                                      Section {a.sectionName} — {a.staffName}
+                                    </label>
+                                  ))}
+                                </div>
+                                <button
+                                  onClick={handleAddMembers}
+                                  disabled={addGroupsSaving || addGroupAssignments.size === 0}
+                                  className="w-full btn btn-xs gap-1.5 border-none text-white cursor-pointer disabled:opacity-50"
+                                  style={{ background: 'linear-gradient(var(--primary), var(--primary-dark))' }}
+                                >
+                                  {addGroupsSaving ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                                  Add to combined class
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </Fragment>
+              ));
+            })()}
+                </>
+              )}
             </div>
           </div>
         </div>
       )}
 
       {showCmr && generation && (
-        <div className="fixed inset-0 z-50 flex items-center justify-end" style={{ background: 'var(--modal-bg)' }}>
+        <div className="fixed inset-0 z-50 flex items-center justify-end" style={{ background: 'rgba(9, 25, 35, 0.35)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)' }}>
           <div className="h-full w-full max-w-[440px] bg-base-100 flex flex-col" style={{ borderLeft: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -3504,6 +5137,7 @@ export function SharedTimetableWorkspace({ generationId, onBack, onNotFound, sta
               <CourseRequirementsPanel
                 unitId={staff.unitId}
                 lobbyId={lobby?.lobbyId ?? null}
+                semesters={(scope ?? []).map((sc) => ({ semesterId: sc.semesterId, semesterNo: sc.semesterNo }))}
               />
             </div>
           </div>
@@ -3761,7 +5395,7 @@ function GeneratedTimetablesCard({
         {sorted.length === 0 && (
           <div style={{ fontSize: 12.5, color: 'var(--text-lighter)' }}>No generation sessions yet</div>
         )}
-        {sorted.slice(0, 6).map((g) => (
+        {sorted.map((g) => (
           <div key={g.generationId} className="flex items-center justify-between gap-3 py-2.5" style={{ borderBottom: '1px solid var(--divider)' }}>
             <div className="min-w-0">
               <div className="truncate" style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text)' }}>{g.academicYear}</div>
@@ -3795,6 +5429,8 @@ function GeneratedTimetablesCard({
 }
 
 export function TimetableGenerationSection() {
+  const router = useRouter();
+  const lastEditStartRef = useRef<string | null>(null);
   const [staff, setStaff] = useState<StaffRecord | null>(null);
   const [terms, setTerms] = useState<AcademicTermRecord[]>([]);
   const [lobbies, setLobbies] = useState<TimetableLobbyResponse[] | null>(null);
@@ -3925,6 +5561,19 @@ export function TimetableGenerationSection() {
           refreshLobbies();
         }
         break;
+      case TIMETABLE_REALTIME_EVENTS.EDIT_STARTED: {
+        // The lobby creator opened the dedicated edit workspace: every joined
+        // HOD on the hub navigates there too. Dedup repeated deliveries and
+        // never navigate when already on the edit route.
+        const target = event.generationId;
+        if (!target) break;
+        if (deadGenerationIdsRef.current.has(target)) break;
+        if (lastEditStartRef.current === target) break;
+        lastEditStartRef.current = target;
+        if (typeof window !== 'undefined' && window.location.pathname === '/lecturer/timetable-edit') break;
+        router.push(`/lecturer/timetable-edit?generationId=${encodeURIComponent(target)}`);
+        break;
+      }
       case TIMETABLE_REALTIME_EVENTS.LOBBY_MEMBER_JOINED:
       case TIMETABLE_REALTIME_EVENTS.LOBBY_CANCELLED:
       case TIMETABLE_REALTIME_EVENTS.GENERATION_STARTED:
@@ -4096,23 +5745,24 @@ export function TimetableGenerationSection() {
   if (workspaceGenerationId && staff) {
     return (
       <SharedTimetableWorkspace
+        key={workspaceGenerationId}
         generationId={workspaceGenerationId}
         onBack={() => {
           setDraftDismissed(true);
           setWorkspaceGenerationId(null);
           load();
         }}
-        onNotFound={(goneId) => {
-          // The referenced session does not exist (e.g. a stale draft id).
-          // Record it so no effect navigates there again, then return to the
-          // hub — no reload required.
-          deadGenerationIdsRef.current.add(goneId);
-          if (lastManagementStartRef.current === goneId) lastManagementStartRef.current = null;
-          setDraftDismissed(true);
-          setWorkspaceGenerationId(null);
-          load();
-        }}
-        staff={staff}
+onNotFound={(goneId) => {
+            // The referenced session does not exist (e.g. a stale draft id).
+            // Record it so no effect navigates there again, then return to the
+            // hub — no reload required.
+            deadGenerationIdsRef.current.add(goneId);
+            if (lastManagementStartRef.current === goneId) lastManagementStartRef.current = null;
+            setDraftDismissed(true);
+            setWorkspaceGenerationId(null);
+            load();
+          }}
+          staff={staff}
       />
     );
   }
@@ -4239,7 +5889,7 @@ export function TimetableGenerationSection() {
       )}
 
       {showInvite && activeLobby && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'var(--modal-bg)' }}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={MODAL_BACKDROP}>
           <div className="bg-base-100 w-full max-w-md" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -4287,7 +5937,7 @@ export function TimetableGenerationSection() {
       )}
 
       {confirmDialog && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'var(--modal-bg)' }}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={MODAL_BACKDROP}>
           <div className="bg-base-100 w-full max-w-md" style={{ borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }}>
             <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--surface)' }}>
               <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--accent)' }}>{confirmDialog.title}</div>
@@ -4348,6 +5998,20 @@ export function TimetableSection() {
       [termId]
     )
   );
+  // While the first schedule fetch for the chosen term is in flight the grid
+  // shows its skeleton. The refresh below re-runs the fetcher immediately for
+  // the picked term — the hook otherwise swaps from the placeholder [] only on
+  // its next polling cycle.
+  const [termFetching, setTermFetching] = useState(false);
+  const fetchedTermRef = useRef('');
+  useEffect(() => {
+    if (!termId || fetchedTermRef.current === termId) return;
+    fetchedTermRef.current = termId;
+    setTermFetching(true);
+    schedules.refresh()
+      .then(() => setTermFetching(false))
+      .catch(() => setTermFetching(false));
+  }, [termId, schedules]);
   const [todayIdx, setTodayIdx] = useState(-1);
   useEffect(() => {
     const d = new Date().getDay();
@@ -4356,28 +6020,31 @@ export function TimetableSection() {
   }, []);
 
   const published = useMemo(() => schedules.data ?? [], [schedules.data]);
-  const [viewSemester, setViewSemester] = useState<number | 'all'>('all');
-  const [viewSection, setViewSection] = useState<string>('all');
-  const publishedSemOptions = useMemo(
-    () => [...new Set(published.map((s) => s.semesterNo))].sort((a, b) => a - b),
-    [published]
-  );
-  const publishedSectionOptions = useMemo(
-    () => [...new Set(published.flatMap((s) => s.sections ?? []))].sort(),
-    [published]
-  );
-  const activePublishedSem = viewSemester;
-  const activePublishedSection = viewSection !== 'all' && publishedSectionOptions.includes(viewSection) ? viewSection : 'all';
-  const visiblePublished = useMemo(
-    () =>
-      published.filter(
-        (s) =>
-          (activePublishedSem === 'all' || s.semesterNo === activePublishedSem) &&
-          (activePublishedSection === 'all' || (s.sections ?? []).includes(activePublishedSection))
-      ),
-    [published, activePublishedSem, activePublishedSection]
-  );
+  const cohortGroups = useMemo(() => groupSchedulesByCohort(published), [published]);
+  const semesterTiles = useMemo(() => {
+    const tiles = new Map<number, { semesterNo: number; groups: { semesterNo: number; section: string; items: ScheduleResponse[] }[] }>();
+    for (const g of cohortGroups) {
+      const tile = tiles.get(g.semesterNo) ?? {
+        semesterNo: g.semesterNo,
+        groups: [] as { semesterNo: number; section: string; items: ScheduleResponse[] }[],
+      };
+      const merged = tile.groups.find((x) => x.section === g.section);
+      if (merged) {
+        for (const item of g.items) {
+          if (!merged.items.some((i) => i.scheduleId === item.scheduleId)) merged.items.push(item);
+        }
+      } else {
+        tile.groups.push(g);
+      }
+      tiles.set(g.semesterNo, tile);
+    }
+    return [...tiles.values()]
+      .map((t) => ({ ...t, groups: [...t.groups].sort((a, b) => a.section.localeCompare(b.section)) }))
+      .sort((a, b) => a.semesterNo - b.semesterNo);
+  }, [cohortGroups]);
   const { periodLabels, lunchLabel } = useTimeSlotLabels();
+  const timetableSkeleton = terms.loading || termFetching;
+  const semCount = published.filter((s) => s.scheduleType === 'COURSE').length;
 
   return (
     <div>
@@ -4423,96 +6090,99 @@ export function TimetableSection() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <CalendarDays size={15} style={{ color: 'var(--primary)' }} />
             <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--accent)' }}>
-              Weekly View {visiblePublished.length > 0 ? `(${visiblePublished.length} schedules${activePublishedSem !== 'all' ? ` · Semester ${activePublishedSem}` : ' · overview'}${activePublishedSection !== 'all' ? ` · Section ${activePublishedSection}` : ''})` : ''}
+              Published Weekly Timetable {semCount > 0 ? `(${semCount} schedules)` : ''}
             </span>
           </div>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            {publishedSemOptions.length > 1 && (
-              <select
-                value={String(activePublishedSem)}
-                onChange={(e) => setViewSemester(e.target.value === 'all' ? 'all' : Number(e.target.value))}
-                className="cursor-pointer"
-                style={{
-                  fontSize: 12,
-                  fontWeight: 600,
-                  padding: '5px 10px',
-                  borderRadius: 'var(--radius-sm)',
-                  border: '1.5px solid var(--surface-border)',
-                  background: 'var(--divider)',
-                  color: 'var(--text)',
-                  outline: 'none',
-                }}
-                title="Filter the timetable by semester — 'All semesters' is an overview mode where all cohorts are drawn together"
-              >
-                <option value="all">All semesters (overview)</option>
-                {publishedSemOptions.map((n) => (
-                  <option key={n} value={n}>Semester {n}</option>
-                ))}
-              </select>
-            )}
-            {publishedSectionOptions.length > 1 && (
-              <select
-                value={activePublishedSection}
-                onChange={(e) => setViewSection(e.target.value)}
-                className="cursor-pointer"
-                style={{
-                  fontSize: 12,
-                  fontWeight: 600,
-                  padding: '5px 10px',
-                  borderRadius: 'var(--radius-sm)',
-                  border: '1.5px solid var(--surface-border)',
-                  background: 'var(--divider)',
-                  color: 'var(--text)',
-                  outline: 'none',
-                }}
-                title="Filter the timetable by section"
-              >
-                <option value="all">All sections</option>
-                {publishedSectionOptions.map((n) => (
-                  <option key={n} value={n}>Section {n}</option>
-                ))}
-              </select>
-            )}
-            {activePublishedSem === 'all' && publishedSemOptions.length > 1 && (
-              <span
-                style={{
-                  fontSize: 10.5,
-                  fontWeight: 600,
-                  padding: '3px 8px',
-                  borderRadius: 'var(--radius-sm)',
-                  background: 'rgba(251,191,36,0.14)',
-                  color: '#b45309',
-                  border: '1px dashed rgba(217,119,6,0.4)',
-                }}
-                title="All cohorts are shown as separate tables here — one table per semester and section, so different cohorts never share a cell"
-              >
-                Overview — one table per semester &amp; section
-              </span>
-            )}
             <span className="badge badge-xs" style={{ background: 'rgba(40,114,161,0.15)', color: 'var(--primary)', border: 'none' }}>Lecture</span>
             <span className="badge badge-xs" style={{ background: 'rgba(139,92,246,0.15)', color: '#7c3aed', border: 'none' }}>LMS</span>
             <span className="badge badge-xs" style={{ background: 'rgba(251,191,36,0.15)', color: '#d97706', border: 'none' }}>Assignment</span>
-            <span className="badge badge-xs" style={{ background: 'rgba(100,116,139,0.15)', color: '#64748b', border: 'none' }}>Break</span>
           </div>
         </div>
-        <div style={{ padding: '16px 18px', overflowX: 'auto' }}>
-          {visiblePublished.length === 0 ? (
+        <div style={{ padding: '18px' }}>
+          {timetableSkeleton ? (
+            <WeeklyGridSkeleton />
+          ) : published.length === 0 ? (
             <div className="text-center py-16">
               <CalendarCog size={32} className="mx-auto mb-3 opacity-30" />
               <p style={{ fontSize: 12.5, color: 'var(--text-lighter)', margin: 0 }}>
-                {published.length === 0
-                  ? 'No timetable published for this term yet'
-                  : 'No schedules for the selected semester or section in this published timetable'}
+                No timetable published for this term yet
               </p>
             </div>
           ) : (
-            <WeeklyTimetableGrid
-                  schedules={visiblePublished}
-                  editable={false}
-                  periodLabels={periodLabels}
-                  lunchLabel={lunchLabel}
-                  todayIdx={todayIdx}
-                />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+              {semesterTiles.map((tile) => (
+                <div
+                  key={tile.semesterNo}
+                  style={{ border: '1px solid var(--surface-border)', borderRadius: 'var(--radius-lg)', overflow: 'hidden' }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '12px 16px',
+                      background: 'rgba(40,114,161,0.06)',
+                      borderBottom: '1px solid var(--surface)',
+                      flexWrap: 'wrap',
+                      gap: 8,
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <span
+                        style={{
+                          width: 26,
+                          height: 26,
+                          borderRadius: 'var(--radius-sm)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          fontWeight: 800,
+                          fontSize: 12,
+                          color: '#fff',
+                          background: 'linear-gradient(var(--primary), var(--primary-dark))',
+                        }}
+                      >
+                        {tile.semesterNo}
+                      </span>
+                      <span style={{ fontSize: 14, fontWeight: 800, color: 'var(--accent)' }}>
+                        {semesterTileLabel(tile.semesterNo)}
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: 20 }}>
+                    {tile.groups.map((g) => (
+                      <div key={g.section}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                          <span
+                            style={{
+                              fontSize: 12,
+                              fontWeight: 800,
+                              letterSpacing: '0.4px',
+                              color: 'var(--text)',
+                              textTransform: 'uppercase',
+                            }}
+                          >
+                            Section {g.section}
+                          </span>
+                          <span style={{ flex: '1 1 auto', height: 1, background: 'var(--surface)' }} />
+                        </div>
+                        <div style={{ border: '1px solid var(--surface)', borderRadius: 'var(--radius-md)', overflow: 'auto' }}>
+                          <WeeklyTimetableGrid
+                            schedules={g.items}
+                            editable={false}
+                            asSingleCohort
+                            periodLabels={periodLabels}
+                            lunchLabel={lunchLabel}
+                            todayIdx={todayIdx}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
           )}
         </div>
       </div>
