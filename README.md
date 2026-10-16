@@ -1,36 +1,87 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# UniConnect
 
-## Getting Started
+University communication platform. Everything runs in one Next.js process:
 
-First, run the development server:
+- **Pages** (App Router) for the four roles: admin, lecturer, student-affairs officer, student
+- **REST API** under `/api/*` (route handlers, MongoDB-backed)
+- **Realtime** via Socket.IO on the same port (Socket.IO is attached to the custom
+  server in `server.mjs`; route handlers publish events through `lib/realtime/emit.ts`)
+
+The only external service is MongoDB (run it via Docker).
+
+## Requirements
+
+- Node.js 20+
+- Docker (for MongoDB)
+- npm
+
+## First-time setup
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+cp .env.local.example .env.local   # then edit SESSION_SECRET (any long random string)
+npm run db:up                      # start the uniconnect-mongo container (port 27017)
+npm run seed                       # seed users, staff, students, courses, …
+npm run dev                        # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`npm run seed` is idempotent — it upserts by natural keys and can be re-run any time.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Database scripts
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Command | What it does |
+|---|---|
+| `npm run db:up` | Start the Mongo container (no-op if already running) |
+| `npm run db:down` | Stop the container (volume `uniconnect_mongo` keeps data) |
+| `npm run db:shell` | Open a `mongosh` shell against the app database |
+| `npm run seed` | (Re)seed all collections |
 
-## Learn More
+## Development / production
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm run dev     # dev server (Turbopack) with Socket.IO
+npm run build   # production build (run `npm run db:up` first)
+npm start       # production server
+npm run lint    # ESLint
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Both `dev` and `start` run `node server.mjs`, which hosts Next.js **and** Socket.IO
+on port 3000. Do not use `next dev`/`next start` directly — sockets would not attach.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Demo logins
 
-## Deploy on Vercel
+All demo accounts are created by the seed (`scripts/seed.mjs`):
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+| Role | Email | Password |
+|---|---|---|
+| Admin | `nyiminyan0099@gmail.com` | `@dmin123` |
+| Lecturer / staff | `dawmya@gmail.com` (any seeded `@gmail.com` staff) | `ucstgo@2026` |
+| Student | `kyawthu100@gmail.com` (any seeded student) | `ucstgo@2026` |
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Architecture notes
+
+- **Auth**: httpOnly JWT session cookie (`uniconnect_session`, 30 days). The same
+  cookie authenticates the Socket.IO connection; clients join `user:<email>`,
+  `role:<role>` and `global` rooms automatically and `conversation:<id>` /
+  `generation:<id>` / `lobby:<id>` rooms on demand.
+- **Realtime events**: catalogue in `lib/realtime/events.ts`; server emitters in
+  `lib/realtime/emit.ts` (no-ops when the socket server is absent, e.g. during
+  `next build`). Timetable-specific events go through `lib/timetable-realtime.ts`.
+- **Files**: uploads are stored on local disk (`UPLOAD_DIR`, default `./uploads`)
+  and served through the session-gated `/api/files/[...path]` route.
+- **Data**: Mongo collections and helpers in `lib/mongo.ts`; canonical row shapes
+  in `lib/types.ts`; academic lookups/DTO mappers in `lib/academic.ts`.
+- Client data access lives in `lib/hooks.ts` (REST + Socket.IO hooks) and
+  `components/shared/api.ts` (academic API wrappers).
+
+## Project layout
+
+```
+server.mjs                 # custom Next.js + Socket.IO server
+scripts/seed.mjs           # Mongo seed (idempotent)
+scripts/db.mjs             # docker helpers (db:up / db:down / db:shell)
+app/                       # pages + /api route handlers
+components/                # role dashboards + shared UI
+lib/                       # auth, mongo, storage, hooks, realtime, academic helpers
+uploads/                   # local file storage (gitignored)
+```
